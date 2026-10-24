@@ -20,6 +20,7 @@ function filterForTeam(state: WorkspaceSnapshot, scope: TeamScope): WorkspaceSna
     leads: tabs.has("Lead pipeline") ? rows(state.leads) : [],
     contentCards: rows(state.contentCards).filter(card => clientIds.has(String(card.clientId))),
     resources: rows(state.resources).filter(resource => resource.scope === "Company" || clientIds.has(String(resource.clientId))),
+    ...(tabs.has("Team & access") ? { roleRows: rows(state.roleRows) } : {}),
   };
 }
 
@@ -39,6 +40,20 @@ function mergeTeamSnapshot(current: WorkspaceSnapshot, incoming: WorkspaceSnapsh
     contentCards: [...rows(current.contentCards).filter(card => !clientIds.has(String(card.clientId))), ...rows(incoming.contentCards).filter(card => clientIds.has(String(card.clientId)))],
   };
   if (tabs.has("Lead pipeline")) merged.leads = rows(incoming.leads);
+  if (tabs.has("Lead pipeline") && Array.isArray(incoming.leadStages) && incoming.leadStages.length) merged.leadStages = incoming.leadStages;
+  if (tabs.has("Settings")) {
+    if (Array.isArray(incoming.onboardingSections) && incoming.onboardingSections.length) merged.onboardingSections = incoming.onboardingSections;
+    if (Array.isArray(incoming.onboardingWorkflow)) merged.onboardingWorkflow = incoming.onboardingWorkflow;
+  }
+  if (tabs.has("Team & access")) {
+    const priorRoles = new Map(rows(current.roleRows).map(role => [String(role.name).toLowerCase(), role]));
+    merged.roleRows = rows(incoming.roleRows).flatMap(role => {
+      const requestedTabs = Array.isArray(role.tabs) ? role.tabs.map(String) : [];
+      const existing = priorRoles.get(String(role.name).toLowerCase());
+      if (requestedTabs.every(tab => tabs.has(tab))) return [role];
+      return existing ? [existing] : [];
+    });
+  }
   if (tabs.has("Resources")) merged.resources = [...rows(current.resources).filter(resource => resource.scope === "Company" || !clientIds.has(String(resource.clientId))), ...rows(incoming.resources).filter(resource => resource.scope === "Client" && clientIds.has(String(resource.clientId)))];
   return merged;
 }
@@ -73,6 +88,9 @@ function mergeLocalSnapshot(current: WorkspaceSnapshot, incoming: WorkspaceSnaps
     clients: [...existingClients, ...extraClients],
     tasks: mergeRows(current.tasks, incoming.tasks, row => String(row.id ?? `${row.client}|${row.title}|${row.due}`)),
     leads: mergeRows(current.leads, incoming.leads, row => `${row.company}|${row.name}`),
+    leadStages: Array.isArray(incoming.leadStages) && incoming.leadStages.length ? incoming.leadStages : current.leadStages,
+    onboardingSections: Array.isArray(incoming.onboardingSections) && incoming.onboardingSections.length ? incoming.onboardingSections : current.onboardingSections,
+    onboardingWorkflow: Array.isArray(incoming.onboardingWorkflow) ? incoming.onboardingWorkflow : current.onboardingWorkflow,
     roleRows: mergeRows(current.roleRows, incoming.roleRows, row => String(row.name).toLowerCase()),
     resources: mergeRows(current.resources, rows(incoming.resources).map(resource => ({ ...resource, ...(remappedClientIds.has(String(resource.clientId)) ? { clientId: remappedClientIds.get(String(resource.clientId)) } : {}) })), row => String(row.id ?? `${row.title}|${row.url}`)),
     contentCards: mergeRows(current.contentCards, rows(incoming.contentCards).map(card => ({ ...card, ...(remappedClientIds.has(String(card.clientId)) ? { clientId: remappedClientIds.get(String(card.clientId)) } : {}) })), row => String(row.id ?? `${row.clientId}|${row.title}`)),
