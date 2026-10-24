@@ -9,7 +9,21 @@ let workspaceSchemaReady: Promise<void> | undefined;
 // Prefer the URL supplied by Vercel's database integration. DATABASE_URL
 // remains the fallback for local development and other deployment platforms.
 export function getDatabaseUrl() {
-  return process.env.POSTGRES_URL?.trim() || process.env.DATABASE_URL?.trim();
+  const connectionString = process.env.POSTGRES_URL?.trim() || process.env.DATABASE_URL?.trim();
+  if (!connectionString) return undefined;
+
+  // pg-connection-string currently treats sslmode=require as verify-full,
+  // while Supabase's serverless guidance uses require for encrypted TLS
+  // without CA validation. Opt into libpq-compatible semantics explicitly.
+  try {
+    const url = new URL(connectionString);
+    if (url.searchParams.get("sslmode")?.toLowerCase() === "require" && !url.searchParams.has("uselibpqcompat")) {
+      url.searchParams.set("uselibpqcompat", "true");
+    }
+    return url.toString();
+  } catch {
+    return connectionString;
+  }
 }
 
 function getPool() {
