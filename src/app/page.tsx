@@ -100,6 +100,44 @@ function Icon({ name, size = 18 }: { name: string; size?: number }) {
 const money = (n: number) => new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", maximumFractionDigits: 0 }).format(n);
 const defaultWorkspaceProfile = { name: "OVYRO LLP", email: "ovyrollp@gmail.com" };
 const emptyWorkspaceSnapshot = { clients: seedClients, tasks: seedTasks, leads: seedLeads, leadStages: defaultLeadStages, onboardingSections: defaultWorkflowSections, onboardingWorkflow: defaultWorkflowSteps, roleRows: initialRoles, resources: seedResources, contentCards: [] as ContentCard[], workspaceProfile: defaultWorkspaceProfile };
+const legacyStorageKeys = ["ovyro-ops-v1", "ovyro-onboarding-template", "ovyro-client-templates", "ovyro-client-templates-migrated", "ovyro-workspace-profile"];
+function readLegacyWorkspaceSnapshot(): Record<string, unknown> | null {
+  try {
+    const stored = localStorage.getItem("ovyro-ops-v1");
+    const data = stored ? JSON.parse(stored) as Record<string, unknown> : {};
+    const snapshot: Record<string, unknown> = {
+      clients: Array.isArray(data.clients) ? (data.clients as Client[]).map(client => ({ ...client, currency: "INR" })) : seedClients,
+      tasks: Array.isArray(data.tasks) ? data.tasks : seedTasks,
+      leads: Array.isArray(data.leads) ? data.leads : seedLeads,
+      leadStages: Array.isArray(data.leadStages) && data.leadStages.length ? data.leadStages : defaultLeadStages,
+      onboardingSections: Array.isArray(data.onboardingSections) && data.onboardingSections.length ? data.onboardingSections : defaultWorkflowSections,
+      onboardingWorkflow: Array.isArray(data.onboardingWorkflow) ? data.onboardingWorkflow : defaultWorkflowSteps,
+      roleRows: Array.isArray(data.roleRows) ? data.roleRows.map((role: Partial<WorkspaceRole>) => ({ name: role.name ?? "Custom role", access: role.access ?? "", users: role.users ?? "0 members", tabs: role.tabs ?? memberAccessTabs })) : initialRoles,
+      resources: Array.isArray(data.resources) ? data.resources.map((resource: Partial<Resource>) => ({ ...resource, scope: resource.scope ?? "Company", clientId: resource.clientId ?? "", audience: resource.scope === "Client" ? "Client team" : "All workspace members" })) : [...seedResources],
+      contentCards: Array.isArray(data.contentCards) ? data.contentCards : [],
+      workspaceProfile: defaultWorkspaceProfile,
+    };
+    const legacyWorkflow = localStorage.getItem("ovyro-onboarding-template");
+    if ((!stored || !Array.isArray(data.onboardingWorkflow)) && legacyWorkflow) snapshot.onboardingWorkflow = JSON.parse(legacyWorkflow) as WorkflowStep[];
+    const profile = localStorage.getItem("ovyro-workspace-profile");
+    if (profile) {
+      const parsed = JSON.parse(profile) as { name?: unknown; email?: unknown };
+      snapshot.workspaceProfile = { name: typeof parsed.name === "string" ? parsed.name : defaultWorkspaceProfile.name, email: typeof parsed.email === "string" ? parsed.email : defaultWorkspaceProfile.email };
+    }
+    if (localStorage.getItem("ovyro-client-templates-migrated") !== "true") {
+      const templates = JSON.parse(localStorage.getItem("ovyro-client-templates") ?? "[]") as { id?: string; name?: string; kind?: string; url?: string }[];
+      const resources = snapshot.resources as Resource[];
+      for (const template of templates) if (template.url?.trim() && !resources.some(resource => resource.url === template.url)) resources.push({ id: `resource-${template.id ?? crypto.randomUUID()}`, title: template.name ?? "Shared template", description: `${template.kind ?? "Client"} template shared across client accounts`, scope: "Company", clientId: "", audience: "All workspace members", url: template.url, fileName: "", fileData: "", updated: "Imported" });
+    }
+    return legacyStorageKeys.some(key => localStorage.getItem(key) !== null) ? snapshot : null;
+  } catch { return null; }
+}
+function hasCustomizedLegacyWorkspace(snapshot: Record<string, unknown>) {
+  return Object.keys(emptyWorkspaceSnapshot).some(key => JSON.stringify(snapshot[key]) !== JSON.stringify(emptyWorkspaceSnapshot[key as keyof typeof emptyWorkspaceSnapshot]));
+}
+function clearLegacyWorkspaceStorage() {
+  try { legacyStorageKeys.forEach(key => localStorage.removeItem(key)); } catch { /* migration has already been safely persisted */ }
+}
 function stableWorkspaceString(value: unknown): string {
   const sortKeys = (item: unknown): unknown => {
     if (Array.isArray(item)) return item.map(sortKeys);
@@ -117,7 +155,7 @@ export default function Home() {
   const [leadStages, setLeadStages] = useState<string[]>(defaultLeadStages);
   const [onboardingSections, setOnboardingSections] = useState<string[]>(defaultWorkflowSections);
   const [onboardingWorkflow, setOnboardingWorkflow] = useState<WorkflowStep[]>(defaultWorkflowSteps);
-  const [members, setMembers] = useState<TeamMember[]>(seedMembers);
+  const [members, setMembers] = useState<TeamMember[]>([]);
   const [resources, setResources] = useState<Resource[]>(seedResources);
   const [contentCards, setContentCards] = useState<ContentCard[]>([]);
   const [selectedContentClient, setSelectedContentClient] = useState("");
@@ -155,6 +193,7 @@ export default function Home() {
   const [identityReady, setIdentityReady] = useState(false);
   const [workspaceReady, setWorkspaceReady] = useState(false);
   const [workspaceSyncEnabled, setWorkspaceSyncEnabled] = useState(false);
+  const [saveRetry, setSaveRetry] = useState(0);
   const lastSyncedWorkspace = useRef("");
   const [memberRole, setMemberRole] = useState("Account strategist");
   const [memberScope, setMemberScope] = useState("All clients");
@@ -179,14 +218,14 @@ export default function Home() {
   const lastSyncedSnapshot = useRef<Record<string, unknown> | null>(null);
   const saveQueue = useRef<Promise<void>>(Promise.resolve());
   const latestWorkspaceFingerprint = useRef("");
+  const legacyWorkspaceSnapshot = useRef<Record<string, unknown> | null>(null);
 
   useEffect(() => {
-    try { ["ovyro-ops-v1", "ovyro-onboarding-template", "ovyro-client-templates", "ovyro-client-templates-migrated", "ovyro-workspace-profile"].forEach(key => localStorage.removeItem(key)); }
-    catch { /* the workspace still loads from the server if browser storage is unavailable */ }
-    finally { setLoaded(true); }
+    legacyWorkspaceSnapshot.current = readLegacyWorkspaceSnapshot();
+    setLoaded(true);
   }, []);
   useEffect(() => { setMounted(true); }, []);
-  useEffect(() => { let cancelled = false; fetch("/api/team/members").then(async response => { if (!response.ok) return; const data = await response.json(); if (cancelled || !Array.isArray(data.members)) return; const owner = { ...seedMembers[0], id: "owner", clientIds: clients.map(client=>client.id), tabs: memberAccessTabs }; const accounts: TeamMember[] = data.members.map((account: {id:string;name:string;email:string;role:string;clientIds:string[];tabs:string[]})=>({id:account.id,name:account.name,email:account.email,role:account.role,clientIds:account.clientIds,scope:account.clientIds.length===clients.length?"All clients":`${account.clientIds.length} clients`,tabs:account.tabs,status:"Active",initials:account.name.split(/\s+/).slice(0,2).map((part:string)=>part[0]).join("").toUpperCase(),tone:"mint"})); setMembers([owner,...accounts]); setAccountsConnected(true); }).catch(()=>{}); return ()=>{cancelled=true;}; }, [clients]);
+  useEffect(() => { let cancelled = false; fetch("/api/team/members").then(async response => { if (!response.ok) return; const data = await response.json(); if (cancelled || !Array.isArray(data.members)) return; const owner = { ...seedMembers[0], id: "owner", clientIds: clients.map(client=>client.id), tabs: allAccessTabs }; const accounts: TeamMember[] = data.members.map((account: {id:string;name:string;email:string;role:string;clientIds:string[];tabs:string[]})=>({id:account.id,name:account.name,email:account.email,role:account.role,clientIds:account.clientIds,scope:account.clientIds.length===clients.length?"All clients":`${account.clientIds.length} clients`,tabs:account.tabs,status:"Active",initials:account.name.split(/\s+/).slice(0,2).map((part:string)=>part[0]).join("").toUpperCase(),tone:"mint"})); setMembers([owner,...accounts]); setAccountsConnected(true); }).catch(()=>{}); return ()=>{cancelled=true;}; }, [clients]);
   useEffect(() => { let cancelled=false; fetch("/api/auth/session").then(async response=>{if(!response.ok)throw new Error("Session expired"); const data=await response.json(); if(!cancelled)setWorkspaceIdentity(data as WorkspaceIdentity);}).catch(()=>{if(!cancelled)window.location.assign("/login");}).finally(()=>{if(!cancelled)setIdentityReady(true);}); return ()=>{cancelled=true;}; }, []);
   const applyWorkspaceSnapshot = (data: Record<string, unknown>) => {
     if (Array.isArray(data.clients)) setClients((data.clients as Client[]).map(client => ({ ...client, currency: "INR" })));
@@ -221,14 +260,27 @@ export default function Home() {
         let serverState = payload.state;
         if (!serverState) {
           if (workspaceIdentity.kind !== "owner") throw new Error("The workspace has not been initialized by an owner yet.");
-          const initialize = await fetch("/api/workspace", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ state: emptyWorkspaceSnapshot, initializeOnly: true }) });
+          const migrationSnapshot = legacyWorkspaceSnapshot.current;
+          const initialize = await fetch("/api/workspace", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ state: migrationSnapshot ?? emptyWorkspaceSnapshot, initializeOnly: true }) });
           if (!initialize.ok) throw new Error("The shared workspace could not be initialized.");
           const initialized = await initialize.json() as { state: Record<string, unknown> | null };
           if (!initialized.state) throw new Error("The shared workspace did not return its saved data.");
           serverState = initialized.state;
+          if (migrationSnapshot && hasCustomizedLegacyWorkspace(migrationSnapshot) && stableWorkspaceString(migrationSnapshot) !== stableWorkspaceString(serverState)) {
+            const merged = await fetch("/api/workspace", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ state: migrationSnapshot, baseState: emptyWorkspaceSnapshot }) });
+            if (!merged.ok) throw new Error("Could not safely merge this browser’s saved workspace data.");
+            const result = await merged.json() as { state: Record<string, unknown> };
+            serverState = result.state;
+          }
+        } else if (workspaceIdentity.kind === "owner" && legacyWorkspaceSnapshot.current && hasCustomizedLegacyWorkspace(legacyWorkspaceSnapshot.current)) {
+          const merged = await fetch("/api/workspace", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ state: legacyWorkspaceSnapshot.current, baseState: emptyWorkspaceSnapshot }) });
+          if (!merged.ok) throw new Error("Could not safely merge this browser’s saved workspace data.");
+          const result = await merged.json() as { state: Record<string, unknown> };
+          serverState = result.state;
         }
         if (cancelled) return;
         applyWorkspaceSnapshot(serverState);
+        if (workspaceIdentity.kind === "owner" && legacyWorkspaceSnapshot.current) clearLegacyWorkspaceStorage();
         lastSyncedSnapshot.current = serverState;
         lastSyncedWorkspace.current = stableWorkspaceString(serverState);
         setWorkspaceLoadError("");
@@ -250,6 +302,7 @@ export default function Home() {
     if (!workspaceReady || !workspaceSyncEnabled || !workspaceIdentity || workspaceFingerprint === lastSyncedWorkspace.current) return;
     const snapshot = workspaceSnapshot;
     const fingerprint = workspaceFingerprint;
+    const retryDelay = saveRetry === 0 ? 400 : Math.min(1000 * 2 ** Math.min(saveRetry, 5), 30000);
     const timer = window.setTimeout(() => {
       saveQueue.current = saveQueue.current.then(async () => {
         const baseState = lastSyncedSnapshot.current;
@@ -260,14 +313,16 @@ export default function Home() {
         if (!result.state) throw new Error("The server did not confirm the workspace save.");
         lastSyncedSnapshot.current = result.state;
         lastSyncedWorkspace.current = stableWorkspaceString(result.state);
+        setSaveRetry(0);
         setWorkspaceLoadError("");
         if (latestWorkspaceFingerprint.current === fingerprint) applyWorkspaceSnapshot(result.state);
       }).catch(error => {
         setWorkspaceLoadError(error instanceof Error ? error.message : "Workspace changes could not be saved to the server.");
+        setSaveRetry(attempt => attempt + 1);
       });
-    }, 400);
+    }, retryDelay);
     return () => window.clearTimeout(timer);
-  }, [workspaceReady, workspaceSyncEnabled, workspaceIdentity, workspaceFingerprint]);
+  }, [workspaceReady, workspaceSyncEnabled, workspaceIdentity, workspaceFingerprint, saveRetry]);
 
   useEffect(() => {
     if (!workspaceReady || !workspaceSyncEnabled || !workspaceIdentity) return;
@@ -320,17 +375,17 @@ export default function Home() {
       if (oldClient && oldClient.name !== clientName) setTasks(tasks.map(task => task.client === oldClient.name ? { ...task, client: clientName } : task));
       setShowNewClient(false); setClientEditId(null); ping(`${clientName} updated`); return;
     }
-    const created: Client = { id: `OV-${String(25 + clients.length - seedClients.length).padStart(3, "0")}`, name: clientName, offer: newOffer.trim() || "New client engagement", status: newStatus, retainer: Number(newRetainer) || 0, currency: "INR", initials: clientName.split(/\s+/).slice(0, 2).map(w => w[0]).join("").toUpperCase(), tone: "mint", owner: newOwner, started: new Date().toLocaleDateString("en-US", { month: "short", day: "2-digit", year: "numeric" }) };
+    const created: Client = { id: `OV-${crypto.randomUUID()}`, name: clientName, offer: newOffer.trim() || "New client engagement", status: newStatus, retainer: Number(newRetainer) || 0, currency: "INR", initials: clientName.split(/\s+/).slice(0, 2).map(w => w[0]).join("").toUpperCase(), tone: "mint", owner: newOwner, started: new Date().toLocaleDateString("en-US", { month: "short", day: "2-digit", year: "numeric" }) };
     setClients([created, ...clients]);
     const activeSteps = onboardingWorkflow.filter(step => step.enabled);
-    const kickoff: Task[] = activeSteps.map((step, i) => ({ id: `${created.id}-task-${i}`, title: step.title, client: clientName, owner: i < 4 ? "Account team" : "Unassigned", due: i < 3 ? "Today" : `Day ${i + 1}`, status: i === 0 ? "In progress" : "To do", section: step.section }));
+    const kickoff: Task[] = activeSteps.map((step, i) => ({ id: `${created.id}-task-${step.id}`, title: step.title, client: clientName, owner: i < 4 ? "Account team" : "Unassigned", due: i < 3 ? "Today" : `Day ${i + 1}`, status: i === 0 ? "In progress" : "To do", section: step.section }));
     setTasks([...kickoff, ...tasks]);
     setShowNewClient(false); setNewName(""); setNewOffer(""); setNewRetainer(""); setNewStatus("Onboarding"); setNewOwner("Unassigned"); setActive("Clients"); ping(`${clientName} added with an onboarding checklist`);
   };
   const deleteClient = (id: string) => {
     const client = clients.find(item => item.id === id);
     setClients(clients.filter(item => item.id !== id));
-    if (client) { setTasks(tasks.filter(task => task.client !== client.name)); setContentCards(contentCards.filter(card => card.clientId !== client.id)); }
+    if (client) { setTasks(tasks.filter(task => task.client !== client.name)); setContentCards(contentCards.filter(card => card.clientId !== client.id)); setResources(resources.filter(resource => resource.scope !== "Client" || resource.clientId !== client.id)); }
     setDeleteTarget(null); ping(`${client?.name ?? "Client"} and its onboarding tasks removed`);
   };
   const openNewMember = () => { setMemberEditId(null); setMemberName(""); setMemberEmail(""); setMemberPassword(""); setMemberRole(availableRoles.some(role => role.name === "Account strategist") ? "Account strategist" : availableRoles[0]?.name ?? "Unassigned"); setMemberScope("All clients"); setMemberClientIds(clients.map(client => client.id)); setShowMemberModal(true); };
@@ -346,9 +401,26 @@ export default function Home() {
     setShowMemberModal(false);
   };
   const deleteMember = async (id: string) => { const member = members.find(item => item.id === id); if (id === "owner") { setDeleteTarget(null); return; } try { const response=await fetch(`/api/team/members/${id}`,{method:"DELETE"}); const data=await response.json(); if(!response.ok){ping(data.error??"Could not remove account.");return;} setMembers(members.filter(item => item.id !== id)); setDeleteTarget(null); ping(`${member?.name ?? "Member"} account removed`); } catch { ping("Could not reach the team account service."); } };
-  const deleteRole = async (name: string) => { const assigned = members.filter(member=>member.role===name&&member.id!=="owner"); for (const member of assigned) { try { await fetch(`/api/team/members/${member.id}`,{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:member.name,email:member.email,role:"Unassigned",clientIds:member.clientIds??[],tabs:[]})}); } catch { /* the role removal remains local and is reported below */ } } setRoleRows(roleRows.filter(role => role.name !== name)); setMembers(members.map(member => member.role === name ? { ...member, role: "Unassigned", tabs: [] } : member)); setDeleteTarget(null); ping(`${name} role deleted`); };
+  const updateAssignedAccounts = async (assigned: TeamMember[], role: string, tabs: string[]) => {
+    const updated: TeamMember[] = [];
+    for (const member of assigned) {
+      try {
+        const response = await fetch(`/api/team/members/${member.id}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: member.name, email: member.email, role, clientIds: member.clientIds ?? [], tabs }) });
+        if (!response.ok) throw new Error("The server rejected a member permission update.");
+        updated.push(member);
+      } catch {
+        for (const prior of updated.reverse()) {
+          try { await fetch(`/api/team/members/${prior.id}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: prior.name, email: prior.email, role: prior.role, clientIds: prior.clientIds ?? [], tabs: prior.tabs ?? [] }) }); } catch { /* report the original failure */ }
+        }
+        ping("Could not update every assigned account. The role change was cancelled; check the team database and try again.");
+        return false;
+      }
+    }
+    return true;
+  };
+  const deleteRole = async (name: string) => { const assigned = members.filter(member=>member.role===name&&member.id!=="owner"); if (!await updateAssignedAccounts(assigned, "Unassigned", [])) return; setRoleRows(roleRows.filter(role => role.name !== name)); setMembers(members.map(member => member.role === name ? { ...member, role: "Unassigned", tabs: [] } : member)); setDeleteTarget(null); ping(`${name} role deleted`); };
   const openEditRole = (index: number) => { const role = roleRows[index]; setRoleEditIndex(index); setRoleNameDraft(role.name); setRoleTabsDraft(role.tabs); };
-  const saveRole = async () => { if (roleEditIndex === null || !roleNameDraft.trim() || roleTabsDraft.length === 0) return; const previous = roleRows[roleEditIndex]; const next = roleNameDraft.trim(); if (roleRows.some((role, index) => index !== roleEditIndex && role.name.toLowerCase() === next.toLowerCase())) { ping("A role with that name already exists"); return; } const assigned = members.filter(member=>member.role===previous.name&&member.id!=="owner"); for (const member of assigned) { try { await fetch(`/api/team/members/${member.id}`,{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:member.name,email:member.email,role:next,clientIds:member.clientIds??[],tabs:roleTabsDraft})}); } catch { /* local role policy remains saved for the owner */ } } setRoleRows(roleRows.map((role, index) => index === roleEditIndex ? { ...role, name: next, tabs: roleTabsDraft, access: roleTabsDraft.join(" · ") } : role)); if (previous.name !== next) setMembers(members.map(member => member.role === previous.name ? { ...member, role: next, tabs: roleTabsDraft } : member)); setRoleEditIndex(null); ping(`${next} role updated`); };
+  const saveRole = async () => { if (roleEditIndex === null || !roleNameDraft.trim() || roleTabsDraft.length === 0) return; const previous = roleRows[roleEditIndex]; const next = roleNameDraft.trim(); if (roleRows.some((role, index) => index !== roleEditIndex && role.name.toLowerCase() === next.toLowerCase())) { ping("A role with that name already exists"); return; } const assigned = members.filter(member=>member.role===previous.name&&member.id!=="owner"); if (!await updateAssignedAccounts(assigned, next, roleTabsDraft)) return; setRoleRows(roleRows.map((role, index) => index === roleEditIndex ? { ...role, name: next, tabs: roleTabsDraft, access: roleTabsDraft.join(" · ") } : role)); if (previous.name !== next) setMembers(members.map(member => member.role === previous.name ? { ...member, role: next, tabs: roleTabsDraft } : member)); setRoleEditIndex(null); ping(`${next} role updated`); };
   const moveTask = (id: string, status: string) => setTasks(tasks.map(t => t.id === id ? { ...t, status } : t));
   const moveLead = (name: string, stage: string) => setLeads(leads.map(l => l.name === name ? { ...l, stage } : l));
   const renameLeadStage = (stage: string, value: string) => {
@@ -426,7 +498,7 @@ export default function Home() {
       </div>
     </main>
 
-    {showNewClient && <div className="modal-backdrop" onMouseDown={e => { if (e.target === e.currentTarget) { setShowNewClient(false); setClientEditId(null); } }}><form className="modal" onSubmit={e => { e.preventDefault(); addClient(); }}><div className="modal-head"><div><div className="eyebrow">CLIENT WORKSPACE</div><h2>{clientEditId ? "Edit client" : "Add a client"}</h2><p>{clientEditId ? "Update this client’s details and account settings." : "Create a client space and generate their onboarding checklist."}</p></div><button type="button" className="icon-button" onClick={() => { setShowNewClient(false); setClientEditId(null); }}><Icon name="close"/></button></div><label className="field-label">Client or business name<input autoFocus value={newName} onChange={e => setNewName(e.target.value)} placeholder="e.g. Acme Wellness" required/></label><label className="field-label">Offer / engagement<input value={newOffer} onChange={e => setNewOffer(e.target.value)} placeholder="e.g. Patient acquisition"/></label><label className="field-label">Monthly retainer (INR)<input type="number" min="0" value={newRetainer} onChange={e => setNewRetainer(e.target.value)} placeholder="0"/></label><label className="field-label">Client status<select value={newStatus} onChange={e => setNewStatus(e.target.value)}><option>Onboarding</option><option>Active</option><option>Paused</option></select></label><label className="field-label">Account owner<select value={newOwner} onChange={e => setNewOwner(e.target.value)}><option value="Unassigned">Unassigned</option>{[...new Set([newOwner, ...members.map(member => member.name)].filter(name => name !== "Unassigned"))].map(name=><option key={name} value={name}>{name}</option>)}</select></label><div className="modal-foot"><span>{clientEditId ? "Changes save in this browser" : "17 starter tasks will be added"}</span><button type="button" className="button button-quiet" onClick={() => { setShowNewClient(false); setClientEditId(null); }}>Cancel</button><button type="submit" className="button button-dark"><Icon name={clientEditId ? "edit" : "plus"} size={16}/>{clientEditId ? "Save changes" : "Create client"}</button></div></form></div>}
+    {showNewClient && <div className="modal-backdrop" onMouseDown={e => { if (e.target === e.currentTarget) { setShowNewClient(false); setClientEditId(null); } }}><form className="modal" onSubmit={e => { e.preventDefault(); addClient(); }}><div className="modal-head"><div><div className="eyebrow">CLIENT WORKSPACE</div><h2>{clientEditId ? "Edit client" : "Add a client"}</h2><p>{clientEditId ? "Update this client’s details and account settings." : "Create a client space and generate their onboarding checklist."}</p></div><button type="button" className="icon-button" onClick={() => { setShowNewClient(false); setClientEditId(null); }}><Icon name="close"/></button></div><label className="field-label">Client or business name<input autoFocus value={newName} onChange={e => setNewName(e.target.value)} placeholder="e.g. Acme Wellness" required/></label><label className="field-label">Offer / engagement<input value={newOffer} onChange={e => setNewOffer(e.target.value)} placeholder="e.g. Patient acquisition"/></label><label className="field-label">Monthly retainer (INR)<input type="number" min="0" value={newRetainer} onChange={e => setNewRetainer(e.target.value)} placeholder="0"/></label><label className="field-label">Client status<select value={newStatus} onChange={e => setNewStatus(e.target.value)}><option>Onboarding</option><option>Active</option><option>Paused</option></select></label><label className="field-label">Account owner<select value={newOwner} onChange={e => setNewOwner(e.target.value)}><option value="Unassigned">Unassigned</option>{[...new Set([newOwner, ...members.map(member => member.name)].filter(name => name !== "Unassigned"))].map(name=><option key={name} value={name}>{name}</option>)}</select></label><div className="modal-foot"><span>{clientEditId ? "Changes sync to the shared workspace" : `${onboardingWorkflow.filter(step => step.enabled).length} starter tasks will be added`}</span><button type="button" className="button button-quiet" onClick={() => { setShowNewClient(false); setClientEditId(null); }}>Cancel</button><button type="submit" className="button button-dark"><Icon name={clientEditId ? "edit" : "plus"} size={16}/>{clientEditId ? "Save changes" : "Create client"}</button></div></form></div>}
     {showNewLead && <div className="modal-backdrop" onMouseDown={e => { if (e.target === e.currentTarget) setShowNewLead(false); }}><form className="modal" onSubmit={e => { e.preventDefault(); saveLead(); }}><div className="modal-head"><div><div className="eyebrow">NEW BUSINESS</div><h2>{leadEditName ? "Edit lead" : "Add a lead"}</h2><p>{leadEditName ? "Update this opportunity’s contact, company, and retainer." : "Start tracking an opportunity in your pipeline."}</p></div><button type="button" className="icon-button" onClick={() => setShowNewLead(false)}><Icon name="close"/></button></div><label className="field-label">Contact name<input autoFocus value={newLeadName} onChange={e => setNewLeadName(e.target.value)} placeholder="e.g. Alex Morgan" required/></label><label className="field-label">Company<input value={newLeadCompany} onChange={e => setNewLeadCompany(e.target.value)} placeholder="e.g. Morgan Wellness" required/></label><label className="field-label">Potential monthly retainer (INR)<input type="number" min="0" value={newLeadValue} onChange={e => setNewLeadValue(e.target.value)} placeholder="0"/></label><div className="modal-foot"><span>{leadEditName ? "Stage and source stay unchanged" : "Lead will start in New Lead"}</span><button type="button" className="button button-quiet" onClick={() => setShowNewLead(false)}>Cancel</button><button type="submit" className="button button-dark"><Icon name={leadEditName ? "edit" : "plus"} size={16}/> {leadEditName ? "Save changes" : "Add lead"}</button></div></form></div>}
     {showContentModal && <div className="modal-backdrop" onMouseDown={e => { if (e.target === e.currentTarget) setShowContentModal(false); }}><form className="modal content-editor-modal" onSubmit={e=>{e.preventDefault();saveContent();}}><div className="modal-head"><div><div className="eyebrow">{clients.find(c=>c.id===selectedContentClient)?.name ?? "CLIENT"} · CONTENT</div><h2>{contentEditId ? "Edit content" : "Add content"}</h2><p>This card belongs to the selected client and stays separate from onboarding tasks.</p></div><button type="button" className="icon-button" onClick={()=>setShowContentModal(false)}><Icon name="close"/></button></div><label className="field-label">Content title<input autoFocus value={contentTitle} onChange={e=>setContentTitle(e.target.value)} placeholder="e.g. Founder story — Meta video ad" required/></label><div className="content-form-row"><label className="field-label">Channel<select value={contentPlatform} onChange={e=>setContentPlatform(e.target.value)}><option>Meta Ads</option><option>Google / YouTube</option><option>Landing page VSL</option><option>Other</option></select></label><label className="field-label">Creative type / framework<input value={contentFormat} onChange={e=>setContentFormat(e.target.value)} placeholder="e.g. UGC testimonial"/></label></div><label className="field-label">Status<select value={contentStatus} onChange={e=>setContentStatus(e.target.value)}>{contentStatuses.map(status=><option key={status}>{status}</option>)}</select></label><label className="field-label">Script / concept<textarea rows={5} value={contentCopy} onChange={e=>setContentCopy(e.target.value)} placeholder="Write the concept, hook, script, or production notes..."/></label><label className="field-label">Creative asset link<input type="url" value={contentAssetUrl} onChange={e=>setContentAssetUrl(e.target.value)} placeholder="https://drive.google.com/..."/></label><div className="modal-foot"><span>Saved to the shared workspace</span><button type="button" className="button button-quiet" onClick={()=>setShowContentModal(false)}>Cancel</button><button type="submit" className="button button-dark"><Icon name={contentEditId ? "edit" : "plus"} size={15}/>{contentEditId ? "Save changes" : "Add card"}</button></div></form></div>}
     {resourceModal && <div className="modal-backdrop" onMouseDown={e => { if (e.target === e.currentTarget) setResourceModal(false); }}><form className="modal" onSubmit={e => { e.preventDefault(); saveResource(); }}><div className="modal-head"><div><div className="eyebrow">SHARED WORKSPACE LIBRARY</div><h2>{resourceEditId ? "Edit resource" : "Add a resource"}</h2><p>Choose whether this belongs to the whole company or a specific client.</p></div><button type="button" className="icon-button" onClick={() => setResourceModal(false)}><Icon name="close"/></button></div><label className="field-label">Resource location<select value={resourceScope} onChange={e => setResourceScope(e.target.value as "Company" | "Client")}><option value="Company">Company-wide resource</option><option value="Client">Client-specific resource</option></select></label>{resourceScope === "Client" && <label className="field-label">Client<select value={resourceClientId} onChange={e => setResourceClientId(e.target.value)} required>{clients.map(client => <option key={client.id} value={client.id}>{client.name}</option>)}</select></label>}<label className="field-label">Resource name<input autoFocus value={resourceTitle} onChange={e => setResourceTitle(e.target.value)} placeholder="e.g. Brand guidelines" required/></label><label className="field-label">Description<input value={resourceDescription} onChange={e => setResourceDescription(e.target.value)} placeholder="What is this resource for?"/></label><label className="field-label">File link<input type="url" value={resourceUrl} onChange={e => setResourceUrl(e.target.value)} placeholder="https://drive.google.com/..."/></label><label className="field-label">Or upload a file<input type="file" onChange={e => { const f=e.target.files?.[0]; if (!f) return; if (f.size > 2500000) { ping("Files must be 2.5 MB or smaller"); e.currentTarget.value=""; return; } const reader=new FileReader(); reader.onload=()=>{ setResourceFile(String(reader.result ?? "")); setResourceFileName(f.name); }; reader.readAsDataURL(f); }}/>{resourceFileName && <small className="resource-file-selected">Attached: {resourceFileName}</small>}</label><div className="settings-note resource-scope-note"><strong>{resourceScope === "Client" ? "Client team resource" : "Company-wide resource"}</strong><span>{resourceScope === "Client" ? "Organized under the selected client. Intended for teammates who work on that account." : "Available to the whole OVYRO workspace."} Access follows the workspace client scope and the audience selected here.</span></div><div className="modal-foot"><span>Saved to the shared workspace</span><button type="button" className="button button-quiet" onClick={() => setResourceModal(false)}>Cancel</button><button type="submit" className="button button-dark"><Icon name={resourceEditId ? "edit" : "plus"} size={16}/>{resourceEditId ? "Save changes" : "Add resource"}</button></div></form></div>}
@@ -525,7 +597,7 @@ function SettingsPage({ onNavigate, workflow, setWorkflow, sections, setSections
   const createSection=()=>{const next=newSection.trim();if(!next||sections.some(item=>item.toLowerCase()===next.toLowerCase()))return;const nextSections=[...sections,next];setSections(nextSections);setWorkflow(normalize(workflow,nextSections));setNewSection("");};
   const addSubtask=(section:string)=>{const title=(subtaskDrafts[section]??"").trim();if(!title)return;setWorkflow(normalize([...workflow,{id:`workflow-${Date.now()}-${Math.random().toString(36).slice(2,7)}`,title,section,enabled:true}]));setSubtaskDrafts({...subtaskDrafts,[section]:""});};
   const moveSection=(source:string,target:string)=>{if(source===target)return;const next=[...sections];const from=next.indexOf(source),to=next.indexOf(target);if(from<0||to<0)return;next.splice(from,1);next.splice(to,0,source);setSections(next);setWorkflow(normalize(workflow,next));};
-  const moveSubtask=(sourceId:string,targetSection:string,targetId?:string)=>{if(sourceId===targetId)return;const moving=workflow.find(step=>step.id===sourceId);if(!moving)return;const nextSteps=workflow.filter(step=>step.id!==sourceId);const inTarget=nextSteps.filter(step=>step.section===targetSection);const targetIndex=targetId?inTarget.findIndex(step=>step.id===targetId):inTarget.length;if(targetIndex>=0&&moving.section===targetSection){const sourceIndex=workflow.filter(step=>step.section===targetSection).findIndex(step=>step.id===sourceId);const reordered=workflow.filter(step=>step.section===targetSection);[reordered[sourceIndex],reordered[targetIndex]]=[reordered[targetIndex],reordered[sourceIndex]];setWorkflow(normalize([...workflow.filter(step=>step.section!==targetSection),...reordered]));return;}inTarget.splice(targetIndex<0?inTarget.length:targetIndex,0,{...moving,section:targetSection});const merged=[...nextSteps.filter(step=>step.section!==targetSection),...inTarget];setWorkflow(normalize(merged));};
+  const moveSubtask=(sourceId:string,targetSection:string,targetId?:string)=>{if(sourceId===targetId)return;const moving=workflow.find(step=>step.id===sourceId);if(!moving)return;const nextSteps=workflow.filter(step=>step.id!==sourceId);const inTarget=nextSteps.filter(step=>step.section===targetSection);const targetIndex=targetId?inTarget.findIndex(step=>step.id===targetId):inTarget.length;inTarget.splice(targetIndex<0?inTarget.length:targetIndex,0,{...moving,section:targetSection});const merged=[...nextSteps.filter(step=>step.section!==targetSection),...inTarget];setWorkflow(normalize(merged));};
   const onSectionDrop=(event:React.DragEvent,section:string)=>{event.preventDefault();const value=event.dataTransfer.getData("text/plain");if(value.startsWith("section:"))moveSection(value.slice(8),section);else if(value.startsWith("task:"))moveSubtask(value.slice(5),section);};
   const onTaskDrop=(event:React.DragEvent,section:string,targetId:string)=>{event.preventDefault();event.stopPropagation();const value=event.dataTransfer.getData("text/plain");if(value.startsWith("task:"))moveSubtask(value.slice(5),section,targetId);};
   const moveSectionBy=(index:number,direction:number)=>{const target=index+direction;if(target<0||target>=sections.length)return;const next=[...sections];[next[index],next[target]]=[next[target],next[index]];setSections(next);setWorkflow(normalize(workflow,next));};

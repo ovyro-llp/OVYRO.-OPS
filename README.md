@@ -13,7 +13,7 @@ Internal operations workspace for OVYRO client delivery, lead management, and re
 
 ## Important data boundary
 
-Client, task, lead, content, resource, and role data is shared through PostgreSQL across browsers using the same running app. Existing customized browser data is imported when an owner opens the updated app and the shared workspace has not been initialized. Team reads are filtered by assigned clients and tabs, and team updates are merged within their assigned client scope. Workspace profile and onboarding workflow settings remain browser-local. Review role and client assignments carefully before using this for sensitive live client data.
+Client, task, lead, content, resource, role, workspace-profile, and onboarding-workflow data is shared through PostgreSQL across browsers using the same running app. When an owner opens the app, legacy customized browser data is retained until the server confirms initialization or merge; team members do not import local browser data. Team reads are filtered by assigned clients and tabs, and team updates are merged within their assigned client scope. Existing legacy data can only be recovered from a browser where it has not already been cleared by an older version of the app.
 
 ## Run locally
 
