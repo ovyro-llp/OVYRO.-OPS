@@ -98,13 +98,8 @@ function Icon({ name, size = 18 }: { name: string; size?: number }) {
 }
 
 const money = (n: number) => new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", maximumFractionDigits: 0 }).format(n);
-const emptyWorkspaceSnapshot = { clients: seedClients, tasks: seedTasks, leads: seedLeads, leadStages: defaultLeadStages, onboardingSections: defaultWorkflowSections, onboardingWorkflow: defaultWorkflowSteps, roleRows: initialRoles, resources: seedResources, contentCards: [] as ContentCard[] };
-function hasCustomizedWorkspace(data: Record<string, unknown>) {
-  return ["clients", "tasks", "leads", "leadStages", "onboardingSections", "onboardingWorkflow", "roleRows", "resources", "contentCards"].some(key => {
-    const value = data[key];
-    return value !== undefined && JSON.stringify(value) !== JSON.stringify(emptyWorkspaceSnapshot[key as keyof typeof emptyWorkspaceSnapshot]);
-  });
-}
+const defaultWorkspaceProfile = { name: "OVYRO LLP", email: "ovyrollp@gmail.com" };
+const emptyWorkspaceSnapshot = { clients: seedClients, tasks: seedTasks, leads: seedLeads, leadStages: defaultLeadStages, onboardingSections: defaultWorkflowSections, onboardingWorkflow: defaultWorkflowSteps, roleRows: initialRoles, resources: seedResources, contentCards: [] as ContentCard[], workspaceProfile: defaultWorkspaceProfile };
 function stableWorkspaceString(value: unknown): string {
   const sortKeys = (item: unknown): unknown => {
     if (Array.isArray(item)) return item.map(sortKeys);
@@ -179,97 +174,101 @@ export default function Home() {
   const [mounted, setMounted] = useState(false);
   const [roleRows, setRoleRows] = useState<WorkspaceRole[]>(initialRoles);
   const [newRole, setNewRole] = useState("");
+  const [workspaceProfile, setWorkspaceProfile] = useState(defaultWorkspaceProfile);
+  const [workspaceLoadError, setWorkspaceLoadError] = useState("");
+  const lastSyncedSnapshot = useRef<Record<string, unknown> | null>(null);
+  const saveQueue = useRef<Promise<void>>(Promise.resolve());
+  const latestWorkspaceFingerprint = useRef("");
 
   useEffect(() => {
-    try {
-      const saved = localStorage.getItem("ovyro-ops-v1");
-      let migratedResources: Resource[] = [];
-      if (saved) { const data = JSON.parse(saved); if (data.clients) setClients(data.clients.map((client: Client) => ({ ...client, currency: "INR" }))); if (data.tasks) setTasks(data.tasks); if (data.leads) setLeads(data.leads); if (Array.isArray(data.leadStages) && data.leadStages.length) setLeadStages(data.leadStages); if (Array.isArray(data.onboardingSections) && data.onboardingSections.length) setOnboardingSections(data.onboardingSections); if (Array.isArray(data.onboardingWorkflow)) setOnboardingWorkflow(data.onboardingWorkflow); if (data.members) setMembers(data.members.map((member: TeamMember) => member.role === "Workspace admin" ? { ...member, name: "Hrushikesh Bhujbal", email: "bhujbalhrushi24@gmail.com", initials: "HB" } : member)); if (data.roleRows) setRoleRows(data.roleRows.map((role: Partial<WorkspaceRole>) => ({ name: role.name ?? "Custom role", access: role.access ?? "", users: role.users ?? "0 members", tabs: role.tabs ?? memberAccessTabs }))); if (data.resources) migratedResources = data.resources.map((r: Resource) => ({ ...r, scope: r.scope ?? "Company", clientId: r.clientId ?? "", audience: r.scope === "Client" ? "Client team" : "All workspace members" })); if (data.contentCards) setContentCards(data.contentCards); }
-      if (!saved || !Array.isArray(JSON.parse(saved).onboardingWorkflow)) { const legacyWorkflow = localStorage.getItem("ovyro-onboarding-template"); if (legacyWorkflow) setOnboardingWorkflow(JSON.parse(legacyWorkflow) as WorkflowStep[]); }
-      if (localStorage.getItem("ovyro-client-templates-migrated") !== "true") {
-        const oldTemplates = JSON.parse(localStorage.getItem("ovyro-client-templates") ?? "[]") as { id: string; name: string; kind: string; url: string }[];
-        for (const template of oldTemplates) if (template.url?.trim() && !migratedResources.some(r => r.url === template.url)) migratedResources.push({ id: `resource-${template.id}`, title: template.name, description: `${template.kind} template shared across client accounts`, scope: "Company", clientId: "", audience: "All workspace members", url: template.url, fileName: "", fileData: "", updated: "Imported" });
-        localStorage.setItem("ovyro-client-templates-migrated", "true");
-      }
-      if (migratedResources.length) setResources(migratedResources);
-    } catch { /* keep demo data */ }
-    setLoaded(true);
+    try { ["ovyro-ops-v1", "ovyro-onboarding-template", "ovyro-client-templates", "ovyro-client-templates-migrated", "ovyro-workspace-profile"].forEach(key => localStorage.removeItem(key)); }
+    catch { /* the workspace still loads from the server if browser storage is unavailable */ }
+    finally { setLoaded(true); }
   }, []);
   useEffect(() => { setMounted(true); }, []);
   useEffect(() => { let cancelled = false; fetch("/api/team/members").then(async response => { if (!response.ok) return; const data = await response.json(); if (cancelled || !Array.isArray(data.members)) return; const owner = { ...seedMembers[0], id: "owner", clientIds: clients.map(client=>client.id), tabs: memberAccessTabs }; const accounts: TeamMember[] = data.members.map((account: {id:string;name:string;email:string;role:string;clientIds:string[];tabs:string[]})=>({id:account.id,name:account.name,email:account.email,role:account.role,clientIds:account.clientIds,scope:account.clientIds.length===clients.length?"All clients":`${account.clientIds.length} clients`,tabs:account.tabs,status:"Active",initials:account.name.split(/\s+/).slice(0,2).map((part:string)=>part[0]).join("").toUpperCase(),tone:"mint"})); setMembers([owner,...accounts]); setAccountsConnected(true); }).catch(()=>{}); return ()=>{cancelled=true;}; }, [clients]);
   useEffect(() => { let cancelled=false; fetch("/api/auth/session").then(async response=>{if(!response.ok)throw new Error("Session expired"); const data=await response.json(); if(!cancelled)setWorkspaceIdentity(data as WorkspaceIdentity);}).catch(()=>{if(!cancelled)window.location.assign("/login");}).finally(()=>{if(!cancelled)setIdentityReady(true);}); return ()=>{cancelled=true;}; }, []);
+  const applyWorkspaceSnapshot = (data: Record<string, unknown>) => {
+    if (Array.isArray(data.clients)) setClients((data.clients as Client[]).map(client => ({ ...client, currency: "INR" })));
+    if (Array.isArray(data.tasks)) setTasks(data.tasks as Task[]);
+    if (Array.isArray(data.leads)) setLeads(data.leads as Lead[]);
+    if (Array.isArray(data.leadStages)) setLeadStages(data.leadStages as string[]);
+    if (Array.isArray(data.onboardingSections)) setOnboardingSections(data.onboardingSections as string[]);
+    if (Array.isArray(data.onboardingWorkflow)) setOnboardingWorkflow(data.onboardingWorkflow as WorkflowStep[]);
+    if (Array.isArray(data.roleRows)) setRoleRows(data.roleRows as WorkspaceRole[]);
+    if (Array.isArray(data.resources)) setResources(data.resources as Resource[]);
+    if (Array.isArray(data.contentCards)) setContentCards(data.contentCards as ContentCard[]);
+    if (data.workspaceProfile && typeof data.workspaceProfile === "object") {
+      const profile = data.workspaceProfile as { name?: unknown; email?: unknown };
+      setWorkspaceProfile({ name: typeof profile.name === "string" ? profile.name : defaultWorkspaceProfile.name, email: typeof profile.email === "string" ? profile.email : defaultWorkspaceProfile.email });
+    }
+  };
+  const workspaceSnapshot: Record<string, unknown> = workspaceIdentity?.kind === "owner"
+    ? { clients, tasks, leads, leadStages, onboardingSections, onboardingWorkflow, roleRows, resources, contentCards, workspaceProfile }
+    : { clients, tasks, leads, leadStages, onboardingSections, onboardingWorkflow, roleRows: workspaceIdentity?.tabs?.includes("Team & access") ? roleRows : undefined, resources, contentCards, workspaceProfile };
+  const workspaceFingerprint = stableWorkspaceString(workspaceSnapshot);
+  latestWorkspaceFingerprint.current = workspaceFingerprint;
+
   useEffect(() => {
     if (!loaded || !identityReady || !workspaceIdentity) return;
     let cancelled = false;
-    const applySnapshot = (data: Record<string, unknown>) => {
-      if (Array.isArray(data.clients)) setClients((data.clients as Client[]).map(client => ({ ...client, currency: "INR" })));
-      if (Array.isArray(data.tasks)) setTasks(data.tasks as Task[]);
-      if (Array.isArray(data.leads)) setLeads(data.leads as Lead[]);
-      if (Array.isArray(data.leadStages) && data.leadStages.length) setLeadStages(data.leadStages as string[]);
-      if (Array.isArray(data.onboardingSections) && data.onboardingSections.length) setOnboardingSections(data.onboardingSections as string[]);
-      if (Array.isArray(data.onboardingWorkflow)) setOnboardingWorkflow(data.onboardingWorkflow as WorkflowStep[]);
-      if (Array.isArray(data.roleRows)) setRoleRows(data.roleRows as WorkspaceRole[]);
-      if (Array.isArray(data.resources)) setResources(data.resources as Resource[]);
-      if (Array.isArray(data.contentCards)) setContentCards(data.contentCards as ContentCard[]);
-    };
     const run = async () => {
       try {
         const response = await fetch("/api/workspace", { cache: "no-store" });
-        if (!response.ok) throw new Error("Shared workspace is unavailable");
+        if (!response.ok) throw new Error("The shared workspace database could not be reached.");
         const payload = await response.json() as { state: Record<string, unknown> | null };
         if (cancelled) return;
-        setWorkspaceSyncEnabled(true);
-        if (payload.state) {
-          const stored = localStorage.getItem("ovyro-ops-v1");
-          const localData = stored ? JSON.parse(stored) as Record<string, unknown> : null;
-          const localSnapshot = localData ? { clients: localData.clients ?? seedClients, tasks: localData.tasks ?? seedTasks, leads: localData.leads ?? seedLeads, leadStages: localData.leadStages ?? defaultLeadStages, onboardingSections: localData.onboardingSections ?? defaultWorkflowSections, onboardingWorkflow: localData.onboardingWorkflow ?? defaultWorkflowSteps, roleRows: localData.roleRows ?? initialRoles, resources: localData.resources ?? seedResources, contentCards: localData.contentCards ?? [] } : null;
-          let sharedState = payload.state;
-          if (workspaceIdentity.kind === "owner" && localSnapshot && hasCustomizedWorkspace(localSnapshot) && stableWorkspaceString(localSnapshot) !== stableWorkspaceString(payload.state)) {
-            const merge = await fetch("/api/workspace", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ state: localSnapshot, mergeLocal: true }) });
-            if (!merge.ok) throw new Error("Could not merge this browser’s workspace data");
-            const result = await merge.json() as { state: Record<string, unknown> };
-            sharedState = result.state;
-          }
-          applySnapshot(sharedState);
-          lastSyncedWorkspace.current = stableWorkspaceString(sharedState);
-        } else {
-          const stored = localStorage.getItem("ovyro-ops-v1");
-          const localData = stored ? JSON.parse(stored) as Record<string, unknown> : emptyWorkspaceSnapshot;
-          const localSnapshot = { clients: localData.clients ?? seedClients, tasks: localData.tasks ?? seedTasks, leads: localData.leads ?? seedLeads, leadStages: localData.leadStages ?? defaultLeadStages, onboardingSections: localData.onboardingSections ?? defaultWorkflowSections, onboardingWorkflow: localData.onboardingWorkflow ?? defaultWorkflowSteps, roleRows: localData.roleRows ?? initialRoles, resources: localData.resources ?? seedResources, contentCards: localData.contentCards ?? [] };
-          if (workspaceIdentity.kind === "owner" && stored && hasCustomizedWorkspace(localSnapshot)) {
-            const migration = await fetch("/api/workspace", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ state: localSnapshot, initializeOnly: true }) });
-            if (!migration.ok) throw new Error("Could not migrate local workspace data");
-            const result = await migration.json() as { state: Record<string, unknown> | null };
-            if (cancelled) return;
-            if (result.state) applySnapshot(result.state);
-            lastSyncedWorkspace.current = stableWorkspaceString(result.state ?? localSnapshot);
-          } else {
-            lastSyncedWorkspace.current = stableWorkspaceString(localSnapshot);
-          }
+        let serverState = payload.state;
+        if (!serverState) {
+          if (workspaceIdentity.kind !== "owner") throw new Error("The workspace has not been initialized by an owner yet.");
+          const initialize = await fetch("/api/workspace", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ state: emptyWorkspaceSnapshot, initializeOnly: true }) });
+          if (!initialize.ok) throw new Error("The shared workspace could not be initialized.");
+          const initialized = await initialize.json() as { state: Record<string, unknown> | null };
+          if (!initialized.state) throw new Error("The shared workspace did not return its saved data.");
+          serverState = initialized.state;
         }
-        if (!cancelled) setWorkspaceReady(true);
-      } catch {
-        if (!cancelled) { setWorkspaceSyncEnabled(false); setWorkspaceReady(true); }
+        if (cancelled) return;
+        applyWorkspaceSnapshot(serverState);
+        lastSyncedSnapshot.current = serverState;
+        lastSyncedWorkspace.current = stableWorkspaceString(serverState);
+        setWorkspaceLoadError("");
+        setWorkspaceSyncEnabled(true);
+        setWorkspaceReady(true);
+      } catch (error) {
+        if (!cancelled) {
+          setWorkspaceLoadError(error instanceof Error ? error.message : "Shared workspace unavailable. Try again.");
+          setWorkspaceSyncEnabled(false);
+          setWorkspaceReady(true);
+        }
       }
     };
     void run();
     return () => { cancelled = true; };
   }, [loaded, identityReady, workspaceIdentity]);
-  useEffect(() => { if (loaded) localStorage.setItem("ovyro-ops-v1", JSON.stringify({ clients, tasks, leads, leadStages, onboardingSections, onboardingWorkflow, members, roleRows, resources, contentCards })); }, [clients, tasks, leads, leadStages, onboardingSections, onboardingWorkflow, members, roleRows, resources, contentCards, loaded]);
-  const workspaceSnapshot: Record<string, unknown> = workspaceIdentity?.kind === "owner" ? { clients, tasks, leads, leadStages, onboardingSections, onboardingWorkflow, roleRows, resources, contentCards } : { clients, tasks, leads, leadStages, onboardingSections, onboardingWorkflow, roleRows: workspaceIdentity?.tabs?.includes("Team & access") ? roleRows : undefined, resources, contentCards };
-  const workspaceFingerprint: string = stableWorkspaceString(workspaceSnapshot);
+
   useEffect(() => {
     if (!workspaceReady || !workspaceSyncEnabled || !workspaceIdentity || workspaceFingerprint === lastSyncedWorkspace.current) return;
-    const timer = window.setTimeout(async () => {
-      try {
-        const response = await fetch("/api/workspace", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ state: workspaceSnapshot }) });
-        if (!response.ok) return;
+    const snapshot = workspaceSnapshot;
+    const fingerprint = workspaceFingerprint;
+    const timer = window.setTimeout(() => {
+      saveQueue.current = saveQueue.current.then(async () => {
+        const baseState = lastSyncedSnapshot.current;
+        if (!baseState) throw new Error("No server snapshot is available for this save.");
+        const response = await fetch("/api/workspace", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ state: snapshot, baseState }) });
+        if (!response.ok) throw new Error("Workspace changes could not be saved to the server.");
         const result = await response.json() as { state: Record<string, unknown> | null };
-        if (result.state) lastSyncedWorkspace.current = stableWorkspaceString(result.state);
-      } catch { /* local persistence remains available during temporary network failures */ }
-    }, 450);
+        if (!result.state) throw new Error("The server did not confirm the workspace save.");
+        lastSyncedSnapshot.current = result.state;
+        lastSyncedWorkspace.current = stableWorkspaceString(result.state);
+        setWorkspaceLoadError("");
+        if (latestWorkspaceFingerprint.current === fingerprint) applyWorkspaceSnapshot(result.state);
+      }).catch(error => {
+        setWorkspaceLoadError(error instanceof Error ? error.message : "Workspace changes could not be saved to the server.");
+      });
+    }, 400);
     return () => window.clearTimeout(timer);
   }, [workspaceReady, workspaceSyncEnabled, workspaceIdentity, workspaceFingerprint]);
+
   useEffect(() => {
     if (!workspaceReady || !workspaceSyncEnabled || !workspaceIdentity) return;
     const syncIfClean = async () => {
@@ -279,23 +278,16 @@ export default function Home() {
         if (!response.ok) return;
         const result = await response.json() as { state: Record<string, unknown> | null };
         if (!result.state || stableWorkspaceString(result.state) === lastSyncedWorkspace.current) return;
-        if (Array.isArray(result.state.clients)) setClients((result.state.clients as Client[]).map(client => ({ ...client, currency: "INR" })));
-        if (Array.isArray(result.state.tasks)) setTasks(result.state.tasks as Task[]);
-        if (Array.isArray(result.state.leads)) setLeads(result.state.leads as Lead[]);
-        if (Array.isArray(result.state.leadStages) && result.state.leadStages.length) setLeadStages(result.state.leadStages as string[]);
-        if (Array.isArray(result.state.onboardingSections) && result.state.onboardingSections.length) setOnboardingSections(result.state.onboardingSections as string[]);
-        if (Array.isArray(result.state.onboardingWorkflow)) setOnboardingWorkflow(result.state.onboardingWorkflow as WorkflowStep[]);
-        if (Array.isArray(result.state.roleRows)) setRoleRows(result.state.roleRows as WorkspaceRole[]);
-        if (Array.isArray(result.state.resources)) setResources(result.state.resources as Resource[]);
-        if (Array.isArray(result.state.contentCards)) setContentCards(result.state.contentCards as ContentCard[]);
+        applyWorkspaceSnapshot(result.state);
+        lastSyncedSnapshot.current = result.state;
         lastSyncedWorkspace.current = stableWorkspaceString(result.state);
-      } catch { /* next focus or polling cycle retries */ }
+      } catch { /* the next focus or polling cycle retries */ }
     };
     const onFocus = () => { void syncIfClean(); };
     window.addEventListener("focus", onFocus);
-    const timer = window.setInterval(() => { void syncIfClean(); }, 15000);
+    const timer = window.setInterval(() => { void syncIfClean(); }, 5000);
     return () => { window.removeEventListener("focus", onFocus); window.clearInterval(timer); };
-  }, [workspaceReady, workspaceSyncEnabled, workspaceIdentity, clients, tasks, leads, leadStages, onboardingSections, onboardingWorkflow, roleRows, resources, contentCards]);
+  }, [workspaceReady, workspaceSyncEnabled, workspaceIdentity, workspaceFingerprint]);
 
   useEffect(() => { if (clients.length && !clients.some(client => client.id === selectedContentClient)) setSelectedContentClient(clients[0].id); }, [clients, selectedContentClient]);
 
@@ -407,6 +399,7 @@ export default function Home() {
   // Keep the server render and the browser's first render identical. The app shell
   // depends on the authenticated session, which is only known after hydration.
   if (!mounted || !identityReady || !workspaceIdentity || !workspaceReady) return <main className="login-shell"><section className="login-card">Loading your workspace…</section></main>;
+  if (!workspaceSyncEnabled) return <main className="login-shell"><section className="login-card"><h1>Shared workspace unavailable</h1><p className="login-description">{workspaceLoadError || "Workspace data is available only from the server. No browser copy will be used."}</p><button className="button button-dark login-submit" onClick={() => window.location.reload()}>Retry connection</button></section></main>;
   if (!isOwner && accessibleTabNames.length === 0) return <main className="login-shell"><section className="login-card"><h1>No workspace tabs assigned</h1><p className="login-description">Ask your workspace owner to assign a role with workspace tabs.</p><button className="button button-dark login-submit" onClick={signOut}>Sign out</button></section></main>;
   if (!accessibleTabNames.includes(active)) return <main className="login-shell"><section className="login-card">Loading your workspace…</section></main>;
   return <div className="app-shell">
@@ -419,6 +412,7 @@ export default function Home() {
 
     <main className="main-area">
       <header className="topbar"><div className="breadcrumbs"><span>OVYRO</span><span className="crumb-slash">/</span><strong>{active}</strong></div><div className="top-actions"><label className="search-box"><Icon name="search" size={16}/><input value={query} onChange={e => setQuery(e.target.value)} placeholder="Search anything..."/><kbd>⌘ K</kbd></label><button className="icon-button notification" aria-label="Notifications" onClick={() => ping("You’re all caught up")}><Icon name="bell"/><i/></button><div className="avatar avatar-ink top-avatar">{(workspaceIdentity.name ?? "Hrushikesh Bhujbal").split(/\s+/).slice(0,2).map(part=>part[0]).join("").toUpperCase()}</div></div></header>
+      {workspaceLoadError && <div className="workspace-sync-warning" role="alert"><span>{workspaceLoadError} Your latest changes may not be saved.</span><button type="button" onClick={() => window.location.reload()}>Reload from server</button></div>}
       <div className="page-wrap">
         {active === "Overview" && <Overview clients={allowedClients} tasks={visibleTasks} leads={visibleLeads} leadStages={leadStages} activeClients={activeClients} mrr={mrr} onNavigate={setActive} onNew={openNewClient} onTaskMove={moveTask}/>}
         {active === "Clients" && <ClientsPage clients={filteredClients} onNew={openNewClient} onEdit={openEditClient} onDelete={(client) => setDeleteTarget({ kind: "client", id: client.id, name: client.name })} query={query}/>}
@@ -428,7 +422,7 @@ export default function Home() {
         {active === "Resources" && <ResourcesPage resources={visibleResources} clients={allowedClients} onNew={() => openResource()} onEdit={openResource}/> }
         {active === "Team & access" && canManageTeam && <TeamPage roles={roleRows} setRoles={setRoleRows} roleTabOptions={roleTabOptions} newRole={newRole} setNewRole={setNewRole} members={members} accountsConnected={accountsConnected} onInvite={openNewMember} onEditMember={openEditMember} onDeleteMember={(member) => setDeleteTarget({ kind: "member", id: member.id, name: member.name })} onEditRole={openEditRole} onDeleteRole={(role) => setDeleteTarget({ kind: "role", id: role.name, name: role.name })}/>}
         {active === "Revenue" && <RevenuePage clients={allowedClients}/>}
-        {active === "Settings" && <SettingsPage onNavigate={setActive} workflow={onboardingWorkflow} setWorkflow={setOnboardingWorkflow} sections={onboardingSections} setSections={setOnboardingSections} />}
+        {active === "Settings" && <SettingsPage onNavigate={setActive} workflow={onboardingWorkflow} setWorkflow={setOnboardingWorkflow} sections={onboardingSections} setSections={setOnboardingSections} workspaceProfile={workspaceProfile} setWorkspaceProfile={setWorkspaceProfile} />}
       </div>
     </main>
 
@@ -519,16 +513,11 @@ function RevenuePage({clients}:{clients:Client[]}) {
   return <><PageHeading eyebrow="FINANCE OVERVIEW" title="Revenue tracking" description="Review contracted monthly retainers for your accessible clients."/><div className="metric-grid revenue-metrics"><Metric icon="chart" label="Contracted MRR" value={money(total)} note="Calculated from active client retainers" trend={`${active.length} active clients`} color="green"/><Metric icon="users" label="Retainer clients" value={String(active.length)} note="Active and onboarding accounts" trend="Current workspace data" color="blue"/></div><div className="panel table-panel revenue-table"><div className="panel-head"><div><h2>Client retainers</h2><p>Monthly contracted revenue by client</p></div><span className="secure-pill">INR</span></div><table><thead><tr><th>CLIENT</th><th>STATUS</th><th>MONTHLY RETAINER</th></tr></thead><tbody>{active.map(c=><tr key={c.id}><td><div className="table-client"><Avatar initials={c.initials} tone={c.tone}/><div><strong>{c.name}</strong><span>{c.id}</span></div></div></td><td><Status>{c.status}</Status></td><td><strong className="table-money">{money(c.retainer)}</strong></td></tr>)}</tbody></table>{active.length===0&&<div className="empty-state">No active client retainers in your scope.</div>}</div></>;
 }
 
-function SettingsPage({ onNavigate, workflow, setWorkflow, sections, setSections }: { onNavigate: (page:string)=>void; workflow:WorkflowStep[]; setWorkflow:(steps:WorkflowStep[])=>void; sections:string[]; setSections:(items:string[])=>void }) {
+function SettingsPage({ onNavigate, workflow, setWorkflow, sections, setSections, workspaceProfile, setWorkspaceProfile }: { onNavigate: (page:string)=>void; workflow:WorkflowStep[]; setWorkflow:(steps:WorkflowStep[])=>void; sections:string[]; setSections:(items:string[])=>void; workspaceProfile:{name:string;email:string}; setWorkspaceProfile:(profile:{name:string;email:string})=>void }) {
   const [tab,setTab]=useState("Workspace profile");
-  const [workspaceName,setWorkspaceName]=useState("OVYRO LLP");
-  const [workspaceEmail,setWorkspaceEmail]=useState("ovyrollp@gmail.com");
-  const [profileLoaded,setProfileLoaded]=useState(false);
   const [newSection,setNewSection]=useState("");
   const [sectionDrafts,setSectionDrafts]=useState<Record<string,string>>({});
   const [subtaskDrafts,setSubtaskDrafts]=useState<Record<string,string>>({});
-  useEffect(()=>{try{const savedProfile=localStorage.getItem("ovyro-workspace-profile");if(savedProfile){const profile=JSON.parse(savedProfile);if(profile.name)setWorkspaceName(profile.name);if(profile.email)setWorkspaceEmail(profile.email);}}catch{/* retain profile defaults */}setProfileLoaded(true);},[]);
-  useEffect(()=>{if(profileLoaded)localStorage.setItem("ovyro-workspace-profile",JSON.stringify({name:workspaceName,email:workspaceEmail}));},[workspaceName,workspaceEmail,profileLoaded]);
   const tabs=[{name:"Workspace profile",icon:"settings"},{name:"Onboarding workflow",icon:"check"},{name:"Access & security",icon:"shield"}];
   const normalize=(steps:WorkflowStep[],orderedSections=sections)=>orderedSections.flatMap(section=>steps.filter(step=>step.section===section));
   const renameSection=(section:string,value:string)=>{const next=value.trim();if(!next||sections.some(item=>item!==section&&item.toLowerCase()===next.toLowerCase()))return;const nextSections=sections.map(item=>item===section?next:item);setSections(nextSections);setWorkflow(normalize(workflow.map(step=>step.section===section?{...step,section:next}:step),nextSections));};
@@ -542,7 +531,7 @@ function SettingsPage({ onNavigate, workflow, setWorkflow, sections, setSections
   const moveSectionBy=(index:number,direction:number)=>{const target=index+direction;if(target<0||target>=sections.length)return;const next=[...sections];[next[index],next[target]]=[next[target],next[index]];setSections(next);setWorkflow(normalize(workflow,next));};
   const moveTaskBy=(step:WorkflowStep,direction:number)=>{const same=workflow.filter(item=>item.section===step.section);const index=same.findIndex(item=>item.id===step.id),target=index+direction;if(target<0||target>=same.length)return;[same[index],same[target]]=[same[target],same[index]];setWorkflow(normalize([...workflow.filter(item=>item.section!==step.section),...same]));};
   return <><PageHeading eyebrow="WORKSPACE PREFERENCES" title="Settings" description="Manage your OVYRO operations workspace."/><div className="settings-layout"><div className="settings-nav">{tabs.map(item=><button key={item.name} className={tab===item.name?"active":""} onClick={()=>setTab(item.name)}><Icon name={item.icon}/>{item.name}</button>)}</div><div className="panel settings-panel">
-    {tab==="Workspace profile"&&<><div className="panel-head"><div><h2>Workspace profile</h2><p>Identity and defaults used across your workspace.</p></div></div><div className="settings-fields"><label className="field-label">Workspace name<input value={workspaceName} onChange={e=>setWorkspaceName(e.target.value)}/></label><label className="field-label">Workspace email<input type="email" value={workspaceEmail} onChange={e=>setWorkspaceEmail(e.target.value)}/></label><label className="field-label">Workspace currency<input value="INR · Indian rupee" readOnly /></label></div></>}
+    {tab==="Workspace profile"&&<><div className="panel-head"><div><h2>Workspace profile</h2><p>Identity and defaults used across your workspace.</p></div></div><div className="settings-fields"><label className="field-label">Workspace name<input value={workspaceProfile.name} onChange={e=>setWorkspaceProfile({...workspaceProfile,name:e.target.value})}/></label><label className="field-label">Workspace email<input type="email" value={workspaceProfile.email} onChange={e=>setWorkspaceProfile({...workspaceProfile,email:e.target.value})}/></label><label className="field-label">Workspace currency<input value="INR · Indian rupee" readOnly /></label></div></>}
     {tab==="Onboarding workflow"&&<><div className="panel-head"><div><h2>Onboarding workflow</h2><p>Arrange sections and subtasks for future client checklists.</p></div><span className="secure-pill">{sections.length} sections · {workflow.length} subtasks</span></div><div className="workflow-editor"><div className="settings-note workflow-editor-note"><strong>Drag to arrange your template</strong><span>Changes apply to new client checklists. Existing client tasks stay in place. Drag a subtask into another section, or use the arrow controls.</span></div><div className="workflow-sections-list">{sections.map((section,index)=>{const steps=workflow.filter(step=>step.section===section);return <section className="workflow-section-card" key={section} onDragOver={event=>event.preventDefault()} onDrop={event=>onSectionDrop(event,section)}><header className="workflow-section-head"><button type="button" className="workflow-drag-handle" draggable aria-label={`Drag section ${section}`} title="Drag to reorder section" onDragStart={event=>{event.dataTransfer.effectAllowed="move";event.dataTransfer.setData("text/plain",`section:${section}`);}}><span>⠿</span></button><input aria-label="Section name" value={sectionDrafts[section]??section} onChange={event=>setSectionDrafts({...sectionDrafts,[section]:event.target.value})} onBlur={event=>{renameSection(section,event.currentTarget.value);setSectionDrafts(current=>{const next={...current};delete next[section];return next;});}}/><span className="workflow-section-count">{steps.length} {steps.length===1?"subtask":"subtasks"}</span><div className="workflow-order-actions"><button type="button" aria-label={`Move ${section} up`} disabled={index===0} onClick={()=>moveSectionBy(index,-1)}>↑</button><button type="button" aria-label={`Move ${section} down`} disabled={index===sections.length-1} onClick={()=>moveSectionBy(index,1)}>↓</button></div><button type="button" className="row-action danger-action" aria-label={`Remove ${section} and its template subtasks`} title="Remove section and its subtasks" disabled={sections.length<=1} onClick={()=>removeSection(section)}><Icon name="trash" size={14}/></button></header><div className="workflow-subtasks">{steps.map((step,stepIndex)=><div className={`workflow-template-row ${step.enabled?"":"workflow-disabled"}`} key={step.id} onDragOver={event=>event.preventDefault()} onDrop={event=>onTaskDrop(event,section,step.id)}><button type="button" className="workflow-drag-handle workflow-task-grip" draggable aria-label={`Drag subtask ${step.title}`} title="Drag to reorder or move section" onDragStart={event=>{event.stopPropagation();event.dataTransfer.effectAllowed="move";event.dataTransfer.setData("text/plain",`task:${step.id}`);}}>⠿</button><button type="button" className={`task-check ${step.enabled?"checked":""}`} aria-label={`${step.enabled?"Disable":"Enable"} ${step.title}`} onClick={()=>setWorkflow(workflow.map(item=>item.id===step.id?{...item,enabled:!item.enabled}:item))}>{step.enabled?"✓":""}</button><input aria-label="Subtask name" value={step.title} onChange={event=>setWorkflow(workflow.map(item=>item.id===step.id?{...item,title:event.target.value}:item))}/><div className="workflow-order-actions"><button type="button" aria-label={`Move ${step.title} up`} disabled={stepIndex===0} onClick={()=>moveTaskBy(step,-1)}>↑</button><button type="button" aria-label={`Move ${step.title} down`} disabled={stepIndex===steps.length-1} onClick={()=>moveTaskBy(step,1)}>↓</button></div><button type="button" className="row-action danger-action" title={`Remove ${step.title}`} aria-label={`Remove ${step.title}`} onClick={()=>setWorkflow(workflow.filter(item=>item.id!==step.id))}><Icon name="trash" size={14}/></button></div>)}</div><form className="workflow-add-subtask" onSubmit={event=>{event.preventDefault();addSubtask(section);}}><input aria-label={`New subtask for ${section}`} value={subtaskDrafts[section]??""} onChange={event=>setSubtaskDrafts({...subtaskDrafts,[section]:event.target.value})} placeholder={`Add a subtask to ${section}`}/><button className="button button-quiet" type="submit" disabled={!(subtaskDrafts[section]??"").trim()}><Icon name="plus" size={14}/> Add subtask</button></form></section>})}</div><form className="workflow-add-section" onSubmit={event=>{event.preventDefault();createSection();}}><div><strong>Add a section</strong><span>Sections can be reordered by dragging their handle.</span></div><input value={newSection} onChange={event=>setNewSection(event.target.value)} placeholder="e.g. Campaign launch" aria-label="New section name"/><button className="button button-dark" type="submit" disabled={!newSection.trim()}><Icon name="plus" size={15}/> Add section</button></form></div></>}
     {tab==="Access & security"&&<><div className="panel-head"><div><h2>Access & security</h2><p>Manage workspace membership and resource access.</p></div></div><div className="settings-fields"><div className="settings-note"><strong>Team account security</strong><span>Workspace members receive the tabs and client scope assigned to their account.</span></div><div className="settings-security-card"><div><strong>Workspace members</strong><span>Manage team login details, roles, and client access.</span></div><button className="button button-quiet" onClick={()=>onNavigate("Team & access")}>Manage team <Icon name="arrow" size={14}/></button></div><div className="settings-security-card"><div><strong>Shared resources</strong><span>Manage files and links, including their intended audience.</span></div><button className="button button-quiet" onClick={()=>onNavigate("Resources")}>Open resources <Icon name="arrow" size={14}/></button></div></div></>}
   </div></div></>;

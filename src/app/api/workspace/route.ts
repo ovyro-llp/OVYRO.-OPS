@@ -1,11 +1,52 @@
 import { NextResponse } from "next/server";
 import { cookies } from "next/headers";
 import { adminCookieName, isValidAdminSession, readWorkspaceSession } from "@/lib/admin-auth";
-import { findTeamAccountById, getDatabaseUrl, getWorkspaceState, initializeWorkspaceState, replaceWorkspaceState, updateWorkspaceState } from "@/lib/team-db";
+import { findTeamAccountById, getDatabaseUrl, getWorkspaceState, initializeWorkspaceState, updateWorkspaceState } from "@/lib/team-db";
 
 type TeamScope = { clientIds: string[]; tabs: string[] };
 type WorkspaceSnapshot = Record<string, unknown>;
 const rows = (value: unknown): Record<string, unknown>[] => Array.isArray(value) ? value.filter(item => item && typeof item === "object") as Record<string, unknown>[] : [];
+const arrayValues = (value: unknown): unknown[] => Array.isArray(value) ? value : [];
+const stable = (value: unknown): string => {
+  const normalize = (item: unknown): unknown => Array.isArray(item) ? item.map(normalize) : item && typeof item === "object" ? Object.fromEntries(Object.entries(item).sort(([left], [right]) => left.localeCompare(right)).map(([key, child]) => [key, normalize(child)])) : item;
+  return JSON.stringify(normalize(value));
+};
+
+function itemKey(collection: string, item: unknown, index: number) {
+  if (typeof item !== "object" || item === null) return String(item);
+  const row = item as Record<string, unknown>;
+  if (collection === "leads") return `${String(row.company)}|${String(row.name)}`;
+  if (collection === "tasks") return String(row.id ?? `${row.client}|${row.title}|${row.due}`);
+  if (collection === "roleRows") return String(row.name ?? index).toLowerCase();
+  return String(row.id ?? row.name ?? row.title ?? index);
+}
+
+function mergeArrayDelta(currentValue: unknown, baseValue: unknown, incomingValue: unknown, collection: string) {
+  const current = arrayValues(currentValue), base = arrayValues(baseValue), incoming = arrayValues(incomingValue);
+  if (stable(base) === stable(incoming)) return current;
+  const keyOf = (item: unknown, index: number) => itemKey(collection, item, index);
+  const baseMap = new Map(base.map((item, index) => [keyOf(item, index), item]));
+  const incomingMap = new Map(incoming.map((item, index) => [keyOf(item, index), item]));
+  const merged = new Map(current.map((item, index) => [keyOf(item, index), item]));
+  for (const key of baseMap.keys()) if (!incomingMap.has(key)) merged.delete(key);
+  for (const [key, item] of incomingMap) {
+    if (!baseMap.has(key) || stable(baseMap.get(key)) !== stable(item)) merged.set(key, item);
+  }
+  const orderedKeys = incoming.map(keyOf).filter(key => merged.has(key));
+  const seen = new Set(orderedKeys);
+  return [...orderedKeys.map(key => merged.get(key)), ...Array.from(merged.entries()).filter(([key]) => !seen.has(key)).map(([, value]) => value)];
+}
+
+function mergeSnapshotDelta(current: WorkspaceSnapshot, base: WorkspaceSnapshot, incoming: WorkspaceSnapshot): WorkspaceSnapshot {
+  const next = { ...current };
+  for (const [key, value] of Object.entries(incoming)) {
+    if (stable(base[key]) === stable(value)) continue;
+    next[key] = Array.isArray(value) && Array.isArray(base[key])
+      ? mergeArrayDelta(current[key], base[key], value, key)
+      : value;
+  }
+  return next;
+}
 
 function filterForTeam(state: WorkspaceSnapshot, scope: TeamScope): WorkspaceSnapshot {
   const clientIds = new Set(scope.clientIds);
@@ -24,26 +65,27 @@ function filterForTeam(state: WorkspaceSnapshot, scope: TeamScope): WorkspaceSna
   };
 }
 
-function mergeTeamSnapshot(current: WorkspaceSnapshot, incoming: WorkspaceSnapshot, scope: TeamScope): WorkspaceSnapshot {
+function mergeTeamSnapshot(current: WorkspaceSnapshot, base: WorkspaceSnapshot, incoming: WorkspaceSnapshot, scope: TeamScope): WorkspaceSnapshot {
   const clientIds = new Set(scope.clientIds);
   const oldClients = rows(current.clients);
   const incomingClients = rows(incoming.clients).filter(client => clientIds.has(String(client.id)));
-  const incomingById = new Map(incomingClients.map(client => [String(client.id), client]));
-  const scopedOld = oldClients.filter(client => clientIds.has(String(client.id)));
-  const newClients = oldClients.map(client => incomingById.get(String(client.id)) ?? client);
-  const clientNames = new Set([...scopedOld, ...incomingClients].map(client => String(client.name)));
+  const clientNames = new Set([...oldClients.filter(client => clientIds.has(String(client.id))), ...incomingClients].map(client => String(client.name)));
   const tabs = new Set(scope.tabs);
   const merged: WorkspaceSnapshot = {
     ...current,
-    clients: newClients,
-    tasks: [...rows(current.tasks).filter(task => !clientNames.has(String(task.client))), ...rows(incoming.tasks).filter(task => clientNames.has(String(task.client)))],
-    contentCards: [...rows(current.contentCards).filter(card => !clientIds.has(String(card.clientId))), ...rows(incoming.contentCards).filter(card => clientIds.has(String(card.clientId)))],
+    clients: mergeArrayDelta(oldClients.filter(client => clientIds.has(String(client.id))), rows(base.clients), incomingClients, "clients"),
+    tasks: mergeArrayDelta(rows(current.tasks).filter(task => clientNames.has(String(task.client))), rows(base.tasks), rows(incoming.tasks), "tasks"),
+    contentCards: mergeArrayDelta(rows(current.contentCards).filter(card => clientIds.has(String(card.clientId))), rows(base.contentCards), rows(incoming.contentCards), "contentCards"),
   };
-  if (tabs.has("Lead pipeline")) merged.leads = rows(incoming.leads);
-  if (tabs.has("Lead pipeline") && Array.isArray(incoming.leadStages) && incoming.leadStages.length) merged.leadStages = incoming.leadStages;
+  merged.clients = [...oldClients.filter(client => !clientIds.has(String(client.id))), ...rows(merged.clients)];
+  merged.tasks = [...rows(current.tasks).filter(task => !clientNames.has(String(task.client))), ...rows(merged.tasks)];
+  merged.contentCards = [...rows(current.contentCards).filter(card => !clientIds.has(String(card.clientId))), ...rows(merged.contentCards)];
+  if (tabs.has("Lead pipeline")) merged.leads = mergeArrayDelta(current.leads, base.leads, incoming.leads, "leads");
+  if (tabs.has("Lead pipeline") && Array.isArray(incoming.leadStages)) merged.leadStages = mergeArrayDelta(current.leadStages, base.leadStages, incoming.leadStages, "leadStages");
   if (tabs.has("Settings")) {
-    if (Array.isArray(incoming.onboardingSections) && incoming.onboardingSections.length) merged.onboardingSections = incoming.onboardingSections;
-    if (Array.isArray(incoming.onboardingWorkflow)) merged.onboardingWorkflow = incoming.onboardingWorkflow;
+    if (Array.isArray(incoming.onboardingSections)) merged.onboardingSections = mergeArrayDelta(current.onboardingSections, base.onboardingSections, incoming.onboardingSections, "onboardingSections");
+    if (Array.isArray(incoming.onboardingWorkflow)) merged.onboardingWorkflow = mergeArrayDelta(current.onboardingWorkflow, base.onboardingWorkflow, incoming.onboardingWorkflow, "onboardingWorkflow");
+    if (incoming.workspaceProfile && typeof incoming.workspaceProfile === "object" && stable(base.workspaceProfile) !== stable(incoming.workspaceProfile)) merged.workspaceProfile = incoming.workspaceProfile;
   }
   if (tabs.has("Team & access")) {
     const priorRoles = new Map(rows(current.roleRows).map(role => [String(role.name).toLowerCase(), role]));
@@ -54,47 +96,8 @@ function mergeTeamSnapshot(current: WorkspaceSnapshot, incoming: WorkspaceSnapsh
       return existing ? [existing] : [];
     });
   }
-  if (tabs.has("Resources")) merged.resources = [...rows(current.resources).filter(resource => resource.scope === "Company" || !clientIds.has(String(resource.clientId))), ...rows(incoming.resources).filter(resource => resource.scope === "Client" && clientIds.has(String(resource.clientId)))];
+  if (tabs.has("Resources")) merged.resources = [...rows(current.resources).filter(resource => resource.scope === "Company" || !clientIds.has(String(resource.clientId))), ...rows(mergeArrayDelta(rows(current.resources).filter(resource => resource.scope === "Client" && clientIds.has(String(resource.clientId))), rows(base.resources).filter(resource => resource.scope === "Client"), rows(incoming.resources).filter(resource => resource.scope === "Client"), "resources"))];
   return merged;
-}
-
-function mergeLocalSnapshot(current: WorkspaceSnapshot, incoming: WorkspaceSnapshot): WorkspaceSnapshot {
-  const existingClients = rows(current.clients);
-  const knownClients = new Map(existingClients.map(client => [String(client.id), client]));
-  const remappedClientIds = new Map<string, string>();
-  const extraClients: Record<string, unknown>[] = [];
-  for (const client of rows(incoming.clients)) {
-    const id = String(client.id);
-    const existing = knownClients.get(id);
-    if (!existing) { knownClients.set(id, client); extraClients.push(client); continue; }
-    if (String(existing.name) === String(client.name)) continue;
-    const suffix = String(client.name).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 24) || "imported";
-    let nextId = `${id}-import-${suffix}`;
-    let counter = 2;
-    while (knownClients.has(nextId)) nextId = `${id}-import-${suffix}-${counter++}`;
-    const imported = { ...client, id: nextId };
-    remappedClientIds.set(id, nextId);
-    knownClients.set(nextId, imported);
-    extraClients.push(imported);
-  }
-  const mergeRows = (baseValue: unknown, extraValue: unknown, keyOf: (row: Record<string, unknown>) => string) => {
-    const base = rows(baseValue);
-    const seen = new Set(base.map(keyOf));
-    for (const row of rows(extraValue)) { const key = keyOf(row); if (!seen.has(key)) { base.push(row); seen.add(key); } }
-    return base;
-  };
-  return {
-    ...current,
-    clients: [...existingClients, ...extraClients],
-    tasks: mergeRows(current.tasks, incoming.tasks, row => String(row.id ?? `${row.client}|${row.title}|${row.due}`)),
-    leads: mergeRows(current.leads, incoming.leads, row => `${row.company}|${row.name}`),
-    leadStages: Array.isArray(incoming.leadStages) && incoming.leadStages.length ? incoming.leadStages : current.leadStages,
-    onboardingSections: Array.isArray(incoming.onboardingSections) && incoming.onboardingSections.length ? incoming.onboardingSections : current.onboardingSections,
-    onboardingWorkflow: Array.isArray(incoming.onboardingWorkflow) ? incoming.onboardingWorkflow : current.onboardingWorkflow,
-    roleRows: mergeRows(current.roleRows, incoming.roleRows, row => String(row.name).toLowerCase()),
-    resources: mergeRows(current.resources, rows(incoming.resources).map(resource => ({ ...resource, ...(remappedClientIds.has(String(resource.clientId)) ? { clientId: remappedClientIds.get(String(resource.clientId)) } : {}) })), row => String(row.id ?? `${row.title}|${row.url}`)),
-    contentCards: mergeRows(current.contentCards, rows(incoming.contentCards).map(card => ({ ...card, ...(remappedClientIds.has(String(card.clientId)) ? { clientId: remappedClientIds.get(String(card.clientId)) } : {}) })), row => String(row.id ?? `${row.clientId}|${row.title}`)),
-  };
 }
 
 async function resolveIdentity() {
@@ -122,20 +125,21 @@ export async function PUT(request: Request) {
   try {
     const identity = await resolveIdentity();
     if (!identity) return NextResponse.json({ error: "Not signed in." }, { status: 401 });
-    const body = await request.json() as { state?: unknown; initializeOnly?: boolean; mergeLocal?: boolean };
+    const body = await request.json() as { state?: unknown; baseState?: unknown; initializeOnly?: boolean };
     if (!body.state || typeof body.state !== "object" || Array.isArray(body.state)) return NextResponse.json({ error: "Invalid workspace snapshot." }, { status: 400 });
     const snapshot = body.state as WorkspaceSnapshot;
     if (JSON.stringify(snapshot).length > 12_000_000) return NextResponse.json({ error: "Workspace snapshot is too large." }, { status: 413 });
-    if (identity.kind === "owner") {
-      if (body.mergeLocal) {
-        const merged = await updateWorkspaceState(current => mergeLocalSnapshot(current, snapshot));
-        const state = merged ?? await initializeWorkspaceState(snapshot);
-        return NextResponse.json({ state });
-      }
-      const state = body.initializeOnly ? await initializeWorkspaceState(snapshot) : await replaceWorkspaceState(snapshot);
+    if (body.initializeOnly && identity.kind === "owner") {
+      const state = await initializeWorkspaceState(snapshot);
       return NextResponse.json({ state });
     }
-    const state = await updateWorkspaceState(current => mergeTeamSnapshot(current, snapshot, identity.scope));
+    if (!body.baseState || typeof body.baseState !== "object" || Array.isArray(body.baseState)) return NextResponse.json({ error: "A server snapshot is required before saving workspace changes." }, { status: 409 });
+    const base = body.baseState as WorkspaceSnapshot;
+    if (identity.kind === "owner") {
+      const state = await updateWorkspaceState(current => mergeSnapshotDelta(current, base, snapshot));
+      return state ? NextResponse.json({ state }) : NextResponse.json({ error: "Workspace data has not been initialized." }, { status: 409 });
+    }
+    const state = await updateWorkspaceState(current => mergeTeamSnapshot(current, base, snapshot, identity.scope));
     return state ? NextResponse.json({ state: filterForTeam(state, identity.scope) }) : NextResponse.json({ error: "Workspace data has not been initialized by an owner." }, { status: 409 });
   } catch { return NextResponse.json({ error: "Could not save workspace data." }, { status: 503 }); }
 }
