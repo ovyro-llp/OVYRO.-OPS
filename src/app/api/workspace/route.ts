@@ -104,7 +104,7 @@ export async function PUT(request: Request) {
   try {
     const identity = await resolveIdentity();
     if (!identity) return NextResponse.json({ error: "Not signed in." }, { status: 401 });
-    const body = await request.json() as { state?: unknown; initializeOnly?: boolean };
+    const body = await request.json() as { state?: unknown; initializeOnly?: boolean; mergeLocal?: boolean };
     if (!body.state || typeof body.state !== "object" || Array.isArray(body.state)) return NextResponse.json({ error: "Invalid workspace snapshot." }, { status: 400 });
     const snapshot = body.state as WorkspaceSnapshot;
     if (JSON.stringify(snapshot).length > 12_000_000) return NextResponse.json({ error: "Workspace snapshot is too large." }, { status: 413 });
