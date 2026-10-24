@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { adminCookieName, isValidAdminSession, readWorkspaceSession } from "@/lib/admin-auth";
-import { findTeamAccountById } from "@/lib/team-db";
+import { findTeamAccountById, getDatabaseUrl } from "@/lib/team-db";
 
 export async function proxy(request: NextRequest) {
   const { pathname } = request.nextUrl;
@@ -11,7 +11,7 @@ export async function proxy(request: NextRequest) {
   const token = request.cookies.get(adminCookieName)?.value;
   const session = readWorkspaceSession(token);
   let authenticated = isValidAdminSession(token);
-  if (!authenticated && session?.teamAccountId && process.env.DATABASE_URL) {
+  if (!authenticated && session?.teamAccountId && getDatabaseUrl()) {
     try { const account = await findTeamAccountById(session.teamAccountId); authenticated = Boolean(account && account.email.toLowerCase() === session.email); }
     catch { authenticated = false; }
   }

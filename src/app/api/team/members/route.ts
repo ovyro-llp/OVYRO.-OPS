@@ -11,7 +11,7 @@ function validInput(value: Record<string, unknown>, creating: boolean) {
 export async function GET() {
   if (!await isWorkspaceOwner()) return NextResponse.json({ error: "Owner access required." }, { status: 403 });
   try { return NextResponse.json({ members: await listTeamAccounts() }); }
-  catch { return NextResponse.json({ error: "Team accounts require a working DATABASE_URL." }, { status: 503 }); }
+  catch { return NextResponse.json({ error: "Team accounts require a working DATABASE_URL or POSTGRES_URL." }, { status: 503 }); }
 }
 
 export async function POST(request: Request) {

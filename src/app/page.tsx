@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 type Client = { id: string; name: string; offer: string; status: string; retainer: number; currency: string; initials: string; tone: string; owner: string; started: string };
 type Task = { id: string; title: string; client: string; owner: string; due: string; status: string; section: string };
@@ -95,6 +95,21 @@ function Icon({ name, size = 18 }: { name: string; size?: number }) {
 }
 
 const money = (n: number) => new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", maximumFractionDigits: 0 }).format(n);
+const emptyWorkspaceSnapshot = { clients: seedClients, tasks: seedTasks, leads: seedLeads, roleRows: initialRoles, resources: seedResources, contentCards: [] as ContentCard[] };
+function hasCustomizedWorkspace(data: Record<string, unknown>) {
+  return ["clients", "tasks", "leads", "roleRows", "resources", "contentCards"].some(key => {
+    const value = data[key];
+    return value !== undefined && JSON.stringify(value) !== JSON.stringify(emptyWorkspaceSnapshot[key as keyof typeof emptyWorkspaceSnapshot]);
+  });
+}
+function stableWorkspaceString(value: unknown): string {
+  const sortKeys = (item: unknown): unknown => {
+    if (Array.isArray(item)) return item.map(sortKeys);
+    if (item && typeof item === "object") return Object.fromEntries(Object.entries(item).sort(([a], [b]) => a.localeCompare(b)).map(([key, child]) => [key, sortKeys(child)]));
+    return item;
+  };
+  return JSON.stringify(sortKeys(value));
+}
 
 export default function Home() {
   const [active, setActive] = useState("Overview");
@@ -137,6 +152,9 @@ export default function Home() {
   const [accountsConnected, setAccountsConnected] = useState(false);
   const [workspaceIdentity, setWorkspaceIdentity] = useState<WorkspaceIdentity | null>(null);
   const [identityReady, setIdentityReady] = useState(false);
+  const [workspaceReady, setWorkspaceReady] = useState(false);
+  const [workspaceSyncEnabled, setWorkspaceSyncEnabled] = useState(false);
+  const lastSyncedWorkspace = useRef("");
   const [memberRole, setMemberRole] = useState("Account strategist");
   const [memberScope, setMemberScope] = useState("All clients");
   const [memberClientIds, setMemberClientIds] = useState<string[]>([]);
@@ -173,7 +191,98 @@ export default function Home() {
   useEffect(() => { setMounted(true); }, []);
   useEffect(() => { let cancelled = false; fetch("/api/team/members").then(async response => { if (!response.ok) return; const data = await response.json(); if (cancelled || !Array.isArray(data.members)) return; const owner = { ...seedMembers[0], id: "owner", clientIds: clients.map(client=>client.id), tabs: memberAccessTabs }; const accounts: TeamMember[] = data.members.map((account: {id:string;name:string;email:string;role:string;clientIds:string[];tabs:string[]})=>({id:account.id,name:account.name,email:account.email,role:account.role,clientIds:account.clientIds,scope:account.clientIds.length===clients.length?"All clients":`${account.clientIds.length} clients`,tabs:account.tabs,status:"Active",initials:account.name.split(/\s+/).slice(0,2).map((part:string)=>part[0]).join("").toUpperCase(),tone:"mint"})); setMembers([owner,...accounts]); setAccountsConnected(true); }).catch(()=>{}); return ()=>{cancelled=true;}; }, [clients]);
   useEffect(() => { let cancelled=false; fetch("/api/auth/session").then(async response=>{if(!response.ok)throw new Error("Session expired"); const data=await response.json(); if(!cancelled)setWorkspaceIdentity(data as WorkspaceIdentity);}).catch(()=>{if(!cancelled)window.location.assign("/login");}).finally(()=>{if(!cancelled)setIdentityReady(true);}); return ()=>{cancelled=true;}; }, []);
+  useEffect(() => {
+    if (!loaded || !identityReady || !workspaceIdentity) return;
+    let cancelled = false;
+    const applySnapshot = (data: Record<string, unknown>) => {
+      if (Array.isArray(data.clients)) setClients((data.clients as Client[]).map(client => ({ ...client, currency: "INR" })));
+      if (Array.isArray(data.tasks)) setTasks(data.tasks as Task[]);
+      if (Array.isArray(data.leads)) setLeads(data.leads as Lead[]);
+      if (Array.isArray(data.roleRows)) setRoleRows(data.roleRows as WorkspaceRole[]);
+      if (Array.isArray(data.resources)) setResources(data.resources as Resource[]);
+      if (Array.isArray(data.contentCards)) setContentCards(data.contentCards as ContentCard[]);
+    };
+    const run = async () => {
+      try {
+        const response = await fetch("/api/workspace", { cache: "no-store" });
+        if (!response.ok) throw new Error("Shared workspace is unavailable");
+        const payload = await response.json() as { state: Record<string, unknown> | null };
+        if (cancelled) return;
+        setWorkspaceSyncEnabled(true);
+        if (payload.state) {
+          const stored = localStorage.getItem("ovyro-ops-v1");
+          const localData = stored ? JSON.parse(stored) as Record<string, unknown> : null;
+          const localSnapshot = localData ? { clients: localData.clients ?? seedClients, tasks: localData.tasks ?? seedTasks, leads: localData.leads ?? seedLeads, roleRows: localData.roleRows ?? initialRoles, resources: localData.resources ?? seedResources, contentCards: localData.contentCards ?? [] } : null;
+          let sharedState = payload.state;
+          if (workspaceIdentity.kind === "owner" && localSnapshot && hasCustomizedWorkspace(localSnapshot) && stableWorkspaceString(localSnapshot) !== stableWorkspaceString(payload.state)) {
+            const merge = await fetch("/api/workspace", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ state: localSnapshot, mergeLocal: true }) });
+            if (!merge.ok) throw new Error("Could not merge this browser’s workspace data");
+            const result = await merge.json() as { state: Record<string, unknown> };
+            sharedState = result.state;
+          }
+          applySnapshot(sharedState);
+          lastSyncedWorkspace.current = stableWorkspaceString(sharedState);
+        } else {
+          const stored = localStorage.getItem("ovyro-ops-v1");
+          const localData = stored ? JSON.parse(stored) as Record<string, unknown> : emptyWorkspaceSnapshot;
+          const localSnapshot = { clients: localData.clients ?? seedClients, tasks: localData.tasks ?? seedTasks, leads: localData.leads ?? seedLeads, roleRows: localData.roleRows ?? initialRoles, resources: localData.resources ?? seedResources, contentCards: localData.contentCards ?? [] };
+          if (workspaceIdentity.kind === "owner" && stored && hasCustomizedWorkspace(localSnapshot)) {
+            const migration = await fetch("/api/workspace", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ state: localSnapshot, initializeOnly: true }) });
+            if (!migration.ok) throw new Error("Could not migrate local workspace data");
+            const result = await migration.json() as { state: Record<string, unknown> | null };
+            if (cancelled) return;
+            if (result.state) applySnapshot(result.state);
+            lastSyncedWorkspace.current = stableWorkspaceString(result.state ?? localSnapshot);
+          } else {
+            lastSyncedWorkspace.current = stableWorkspaceString(localSnapshot);
+          }
+        }
+        if (!cancelled) setWorkspaceReady(true);
+      } catch {
+        if (!cancelled) { setWorkspaceSyncEnabled(false); setWorkspaceReady(true); }
+      }
+    };
+    void run();
+    return () => { cancelled = true; };
+  }, [loaded, identityReady, workspaceIdentity]);
   useEffect(() => { if (loaded) localStorage.setItem("ovyro-ops-v1", JSON.stringify({ clients, tasks, leads, members, roleRows, resources, contentCards })); }, [clients, tasks, leads, members, roleRows, resources, contentCards, loaded]);
+  const workspaceSnapshot: Record<string, unknown> = workspaceIdentity?.kind === "owner" ? { clients, tasks, leads, roleRows, resources, contentCards } : { clients, tasks, leads, resources, contentCards };
+  const workspaceFingerprint: string = stableWorkspaceString(workspaceSnapshot);
+  useEffect(() => {
+    if (!workspaceReady || !workspaceSyncEnabled || !workspaceIdentity || workspaceFingerprint === lastSyncedWorkspace.current) return;
+    const timer = window.setTimeout(async () => {
+      try {
+        const response = await fetch("/api/workspace", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ state: workspaceSnapshot }) });
+        if (!response.ok) return;
+        const result = await response.json() as { state: Record<string, unknown> | null };
+        if (result.state) lastSyncedWorkspace.current = stableWorkspaceString(result.state);
+      } catch { /* local persistence remains available during temporary network failures */ }
+    }, 450);
+    return () => window.clearTimeout(timer);
+  }, [workspaceReady, workspaceSyncEnabled, workspaceIdentity, workspaceFingerprint]);
+  useEffect(() => {
+    if (!workspaceReady || !workspaceSyncEnabled || !workspaceIdentity) return;
+    const syncIfClean = async () => {
+      if (workspaceFingerprint !== lastSyncedWorkspace.current) return;
+      try {
+        const response = await fetch("/api/workspace", { cache: "no-store" });
+        if (!response.ok) return;
+        const result = await response.json() as { state: Record<string, unknown> | null };
+        if (!result.state || stableWorkspaceString(result.state) === lastSyncedWorkspace.current) return;
+        if (Array.isArray(result.state.clients)) setClients((result.state.clients as Client[]).map(client => ({ ...client, currency: "INR" })));
+        if (Array.isArray(result.state.tasks)) setTasks(result.state.tasks as Task[]);
+        if (Array.isArray(result.state.leads)) setLeads(result.state.leads as Lead[]);
+        if (Array.isArray(result.state.roleRows)) setRoleRows(result.state.roleRows as WorkspaceRole[]);
+        if (Array.isArray(result.state.resources)) setResources(result.state.resources as Resource[]);
+        if (Array.isArray(result.state.contentCards)) setContentCards(result.state.contentCards as ContentCard[]);
+        lastSyncedWorkspace.current = stableWorkspaceString(result.state);
+      } catch { /* next focus or polling cycle retries */ }
+    };
+    const onFocus = () => { void syncIfClean(); };
+    window.addEventListener("focus", onFocus);
+    const timer = window.setInterval(() => { void syncIfClean(); }, 15000);
+    return () => { window.removeEventListener("focus", onFocus); window.clearInterval(timer); };
+  }, [workspaceReady, workspaceSyncEnabled, workspaceIdentity, clients, tasks, leads, roleRows, resources, contentCards]);
 
   useEffect(() => { if (clients.length && !clients.some(client => client.id === selectedContentClient)) setSelectedContentClient(clients[0].id); }, [clients, selectedContentClient]);
 
@@ -267,7 +376,7 @@ export default function Home() {
 
   // Keep the server render and the browser's first render identical. The app shell
   // depends on the authenticated session, which is only known after hydration.
-  if (!mounted || !identityReady || !workspaceIdentity) return <main className="login-shell"><section className="login-card">Loading your workspace…</section></main>;
+  if (!mounted || !identityReady || !workspaceIdentity || !workspaceReady) return <main className="login-shell"><section className="login-card">Loading your workspace…</section></main>;
   if (!isOwner && accessibleTabNames.length === 0) return <main className="login-shell"><section className="login-card"><h1>No workspace tabs assigned</h1><p className="login-description">Ask your workspace owner to assign a role with workspace tabs.</p><button className="button button-dark login-submit" onClick={signOut}>Sign out</button></section></main>;
   if (!accessibleTabNames.includes(active)) return <main className="login-shell"><section className="login-card">Loading your workspace…</section></main>;
   return <div className="app-shell">

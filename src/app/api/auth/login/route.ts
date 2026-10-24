@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { adminCookieName, createAdminSession, hasAdminConfiguration, verifyAdminCredentials } from "@/lib/admin-auth";
-import { findTeamAccountByEmail, verifyTeamPassword } from "@/lib/team-db";
+import { findTeamAccountByEmail, getDatabaseUrl, verifyTeamPassword } from "@/lib/team-db";
 
 export async function POST(request: Request) {
   if (!hasAdminConfiguration()) return NextResponse.json({ error: "Admin sign-in is not configured on this deployment." }, { status: 503 });
@@ -11,12 +11,16 @@ export async function POST(request: Request) {
   }
   let teamAccountId: string | undefined;
   if (!verifyAdminCredentials(body.email, body.password)) {
-    if (!process.env.DATABASE_URL) return NextResponse.json({ error: "The email or password is incorrect." }, { status: 401 });
+    if (!getDatabaseUrl()) return NextResponse.json({ error: "The email or password is incorrect." }, { status: 401 });
     try {
       const account = await findTeamAccountByEmail(body.email);
       if (!account || !verifyTeamPassword(body.password, String(account.password_hash))) return NextResponse.json({ error: "The email or password is incorrect." }, { status: 401 });
       teamAccountId = String(account.id);
-    } catch { return NextResponse.json({ error: "Team sign-in is temporarily unavailable. Check the database connection." }, { status: 503 }); }
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : "Unknown database error";
+      console.error("Team sign-in database lookup failed:", detail);
+      return NextResponse.json({ error: "Team sign-in is temporarily unavailable. Check the database connection." }, { status: 503 });
+    }
   }
   const session = createAdminSession(body.email, teamAccountId);
   const response = NextResponse.json({ ok: true });
