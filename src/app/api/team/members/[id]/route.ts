@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { getTeamManagementAccess, mayManageAccount, scopeAllows } from "@/lib/owner-auth";
 import { deleteTeamAccount, findTeamAccountById, updateTeamAccount } from "@/lib/team-db";
 
-const validTabs = new Set(["Overview", "Clients", "Onboarding", "Lead pipeline", "Client content", "Resources", "Team & access", "Revenue", "Settings"]);
+const validTabs = new Set(["Overview", "Clients", "Onboarding", "Tasks", "Lead pipeline", "Client content", "Resources", "Team & access", "Revenue", "Settings"]);
 export async function PUT(request: Request, context: { params: Promise<{ id: string }> }) {
   const access = await getTeamManagementAccess();
   if (!access) return NextResponse.json({ error: "Team & access permission required." }, { status: 403 });
