@@ -50,14 +50,16 @@ function mergeSnapshotDelta(current: WorkspaceSnapshot, base: WorkspaceSnapshot,
 
 function filterForTeam(state: WorkspaceSnapshot, scope: TeamScope): WorkspaceSnapshot {
   const clientIds = new Set(scope.clientIds);
-  const clients = rows(state.clients).filter(client => clientIds.has(String(client.id)));
-  const clientNames = new Set(clients.map(client => String(client.name)));
+  const scopedClients = rows(state.clients).filter(client => clientIds.has(String(client.id)));
+  const clientNames = new Set(scopedClients.map(client => String(client.name)));
   const tabs = new Set(scope.tabs);
   const { members: _members, roleRows: _roleRows, ...sharedState } = state;
   return {
     ...sharedState,
-    clients,
-    tasks: rows(state.tasks).filter(task => clientNames.has(String(task.client))),
+    clients: scopedClients.map(client => ({ ...client, retainer: null })),
+    tasks: tabs.has("Onboarding") || tabs.has("Tasks")
+      ? rows(state.tasks).filter(task => clientNames.has(String(task.client)) && (tabs.has("Tasks") || task.kind !== "assigned") && (tabs.has("Onboarding") || task.kind === "assigned"))
+      : [],
     leads: tabs.has("Lead pipeline") ? rows(state.leads) : [],
     contentCards: rows(state.contentCards).filter(card => clientIds.has(String(card.clientId))),
     resources: rows(state.resources).filter(resource => resource.scope === "Company" || clientIds.has(String(resource.clientId))),
@@ -74,11 +76,25 @@ function mergeTeamSnapshot(current: WorkspaceSnapshot, base: WorkspaceSnapshot, 
   const merged: WorkspaceSnapshot = {
     ...current,
     clients: mergeArrayDelta(oldClients.filter(client => clientIds.has(String(client.id))), rows(base.clients), incomingClients, "clients"),
-    tasks: mergeArrayDelta(rows(current.tasks).filter(task => clientNames.has(String(task.client))), rows(base.tasks), rows(incoming.tasks), "tasks"),
+    tasks: rows(current.tasks).filter(task => !clientNames.has(String(task.client))),
     contentCards: mergeArrayDelta(rows(current.contentCards).filter(card => clientIds.has(String(card.clientId))), rows(base.contentCards), rows(incoming.contentCards), "contentCards"),
   };
   merged.clients = [...oldClients.filter(client => !clientIds.has(String(client.id))), ...rows(merged.clients)];
-  merged.tasks = [...rows(current.tasks).filter(task => !clientNames.has(String(task.client))), ...rows(merged.tasks)];
+  const previousById = new Map(oldClients.map(client => [String(client.id), client]));
+  merged.clients = rows(merged.clients).map(client => {
+    if (!clientIds.has(String(client.id))) return client;
+    const previous = previousById.get(String(client.id));
+    return { ...client, retainer: previous ? previous.retainer : 0 };
+  });
+  const currentScopedTasks = rows(current.tasks).filter(task => clientNames.has(String(task.client)));
+  const baseTasks = rows(base.tasks);
+  const incomingTasks = rows(incoming.tasks);
+  const mergedScopedTasks: Record<string, unknown>[] = [];
+  if (tabs.has("Onboarding")) mergedScopedTasks.push(...rows(mergeArrayDelta(currentScopedTasks.filter(task => task.kind !== "assigned"), baseTasks.filter(task => task.kind !== "assigned"), incomingTasks.filter(task => task.kind !== "assigned"), "tasks")));
+  else mergedScopedTasks.push(...currentScopedTasks.filter(task => task.kind !== "assigned"));
+  if (tabs.has("Tasks")) mergedScopedTasks.push(...rows(mergeArrayDelta(currentScopedTasks.filter(task => task.kind === "assigned"), baseTasks.filter(task => task.kind === "assigned"), incomingTasks.filter(task => task.kind === "assigned"), "tasks")));
+  else mergedScopedTasks.push(...currentScopedTasks.filter(task => task.kind === "assigned"));
+  merged.tasks = [...rows(current.tasks).filter(task => !clientNames.has(String(task.client))), ...mergedScopedTasks];
   merged.contentCards = [...rows(current.contentCards).filter(card => !clientIds.has(String(card.clientId))), ...rows(merged.contentCards)];
   if (tabs.has("Lead pipeline")) merged.leads = mergeArrayDelta(current.leads, base.leads, incoming.leads, "leads");
   if (tabs.has("Lead pipeline") && Array.isArray(incoming.leadStages)) merged.leadStages = mergeArrayDelta(current.leadStages, base.leadStages, incoming.leadStages, "leadStages");
