@@ -3,7 +3,7 @@ import { NextResponse } from "next/server";
 import { getTeamManagementAccess, scopeAllows } from "@/lib/owner-auth";
 import { createTeamAccount, listTeamAccounts } from "@/lib/team-db";
 
-const validTabs = new Set(["Overview", "Clients", "Onboarding", "Lead pipeline", "Client content", "Resources", "Team & access", "Revenue", "Settings"]);
+const validTabs = new Set(["Overview", "Clients", "Onboarding", "Tasks", "Lead pipeline", "Client content", "Resources", "Team & access", "Revenue", "Settings"]);
 function validInput(value: Record<string, unknown>, creating: boolean) {
   return typeof value.name === "string" && value.name.trim().length > 0 && typeof value.email === "string" && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.email) && typeof value.role === "string" && value.role.trim().length > 0 && Array.isArray(value.clientIds) && value.clientIds.every(item => typeof item === "string") && Array.isArray(value.tabs) && value.tabs.every(item => typeof item === "string" && validTabs.has(item)) && (!creating || (typeof value.password === "string" && value.password.length >= 12));
 }
